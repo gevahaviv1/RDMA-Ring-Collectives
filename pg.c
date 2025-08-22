@@ -1,5 +1,6 @@
 #include "pg.h"
 #include "chunk_planner.h"
+#include "reduce.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,46 @@ int ibv_close_device(struct ibv_context *ctx);
 
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
 int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
+
+static void pg_init_env(pg_handle *handle) {
+    if (!handle)
+        return;
+    const char *s;
+    if (handle->eager_max == 0) {
+        s = getenv("PG_EAGER_MAX");
+        handle->eager_max = s ? strtoul(s, NULL, 0) : PG_DEFAULT_EAGER_MAX;
+    }
+    if (handle->chunk_bytes == 0) {
+        s = getenv("PG_CHUNK_BYTES");
+        handle->chunk_bytes = s ? strtoul(s, NULL, 0) : PG_DEFAULT_CHUNK_BYTES;
+    }
+    if (handle->inflight_limit == 0) {
+        s = getenv("PG_INFLIGHT");
+        handle->inflight_limit = s ? atoi(s) : PG_DEFAULT_INFLIGHT_LIMIT;
+    }
+}
+
+#ifdef PG_DEBUG
+static long tv_diff_us(const struct timeval *a, const struct timeval *b) {
+    return (b->tv_sec - a->tv_sec) * 1000000L +
+           (b->tv_usec - a->tv_usec);
+}
+#endif
+
+pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
+                     int inflight_limit) {
+    pg_handle *h = calloc(1, sizeof(*h));
+    if (!h)
+        return NULL;
+    h->rank = rank;
+    h->world_size = world_size;
+    h->chunk_bytes = chunk_bytes;
+    h->inflight_limit = inflight_limit;
+    pg_init_env(h);
+    return h;
+}
+
+void pg_destroy(pg_handle *handle) { free(handle); }
 
 void pg_ctrl_init(pg_handle *handle) {
     if (!handle)
@@ -174,9 +215,20 @@ int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
     return 0;
 }
 
-void pg_close(pg_handle *handle) {
-    if (!handle)
-        return;
+int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
+                      size_t count, DATATYPE dtype, OPERATION op) {
+    if (!handle || !sendbuf || !recvbuf)
+        return -1;
+    pg_init_env(handle);
+    int world = handle->world_size;
+    int rank = handle->rank;
+    if (world <= 0 || rank < 0 || rank >= world)
+        return -1;
+
+    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
+    if (chunk_elems == 0)
+        return -1;
+
 
     for (int i = 0; i < 2; ++i) {
         if (handle->qps[i]) {
@@ -185,26 +237,173 @@ void pg_close(pg_handle *handle) {
         }
     }
 
-    if (handle->cq) {
-        ibv_destroy_cq(handle->cq);
-        handle->cq = NULL;
+    size_t eager_limit = handle->eager_max;
+    if (eager_limit > handle->max_inline_data)
+        eager_limit = handle->max_inline_data;
+
+#ifdef PG_DEBUG
+    size_t posted = 0, completed = 0;
+    struct timeval last_post = {0}, last_comp = {0};
+#endif
+
+    for (int round = 0; round < world - 1; ++round) {
+        int send_idx = rs_send_chunk_index(round, rank, world);
+        int recv_idx = rs_recv_chunk_index(round, rank, world);
+
+        size_t send_off = 0, send_len = 0;
+        size_t recv_off = 0, recv_len = 0;
+        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
+                         &send_off, &send_len);
+        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
+                         &recv_off, &recv_len);
+
+        if (recv_len == 0 && send_len == 0)
+            continue;
+
+#ifdef PG_DEBUG
+        struct timeval post_t;
+        gettimeofday(&post_t, NULL);
+        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
+        last_post = post_t;
+        ++posted;
+#endif
+
+        /* Small chunks use inline send/recv helper. */
+        if (recv_len <= eager_limit) {
+            pg_sendrecv_inline(handle,
+                               (char *)sendbuf + send_off,
+                               (char *)recvbuf + recv_off,
+                               recv_len,
+                               eager_limit,
+                               dtype, op);
+        } else {
+            /* Large chunk path: placeholder for full RTS/CTS + READ orchestration.
+               For skeleton purposes fall back to inline helper in chunks. */
+            size_t processed = 0;
+            while (processed < recv_len) {
+                size_t step = handle->max_inline_data;
+                if (step == 0) break;
+                if (processed + step > recv_len)
+                    step = recv_len - processed;
+                pg_sendrecv_inline(handle,
+                                   (char *)sendbuf + send_off + processed,
+                                   (char *)recvbuf + recv_off + processed,
+                                   step,
+                                   handle->max_inline_data,
+                                   dtype, op);
+                processed += step;
+            }
+        }
+
+#ifdef PG_DEBUG
+        struct timeval comp_t;
+        gettimeofday(&comp_t, NULL);
+        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
+        last_comp = comp_t;
+        ++completed;
+        fprintf(stderr,
+                "PGTRACE phase=RS round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
+                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
+#endif
     }
 
-    for (int i = 0; i < 2; ++i) {
-        if (handle->data_mrs[i]) {
-            ibv_dereg_mr(handle->data_mrs[i]);
-            handle->data_mrs[i] = NULL;
+    /* After reduce-scatter each rank owns chunk (rank + 1) % world. */
+    return 0;
+}
+
+int pg_all_gather(pg_handle *handle, void *recvbuf,
+                  size_t count, DATATYPE dtype) {
+    if (!handle || !recvbuf)
+        return -1;
+    pg_init_env(handle);
+    int world = handle->world_size;
+    int rank = handle->rank;
+    if (world <= 0 || rank < 0 || rank >= world)
+        return -1;
+
+    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
+    if (chunk_elems == 0)
+        return -1;
+
+    /* Single rank already has the full vector. */
+    if (world == 1)
+        return 0;
+
+    size_t eager_limit = handle->eager_max;
+    if (eager_limit > handle->max_inline_data)
+        eager_limit = handle->max_inline_data;
+
+#ifdef PG_DEBUG
+    size_t posted = 0, completed = 0;
+    struct timeval last_post = {0}, last_comp = {0};
+#endif
+
+    for (int round = 0; round < world - 1; ++round) {
+        int send_idx = (rank + 1 - round + world) % world;
+        int recv_idx = (rank - round + world) % world;
+
+        size_t send_off = 0, send_len = 0;
+        size_t recv_off = 0, recv_len = 0;
+        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
+                         &send_off, &send_len);
+        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
+                         &recv_off, &recv_len);
+
+        if (recv_len == 0 && send_len == 0)
+            continue;
+
+#ifdef PG_DEBUG
+        struct timeval post_t;
+        gettimeofday(&post_t, NULL);
+        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
+        last_post = post_t;
+        ++posted;
+#endif
+
+        if (recv_len <= eager_limit) {
+            /* Small chunk: emulate inline send/recv with a local copy. */
+            memcpy((char *)recvbuf + recv_off,
+                   (char *)recvbuf + send_off, recv_len);
+        } else {
+            /* Large chunk path: placeholder for READ-based transfer.
+               For skeleton purposes fall back to chunked local copy. */
+            size_t processed = 0;
+            while (processed < recv_len) {
+                size_t step = handle->max_inline_data;
+                if (step == 0)
+                    break;
+                if (processed + step > recv_len)
+                    step = recv_len - processed;
+                memcpy((char *)recvbuf + recv_off + processed,
+                       (char *)recvbuf + send_off + processed,
+                       step);
+                processed += step;
+            }
+
         }
+
+#ifdef PG_DEBUG
+        struct timeval comp_t;
+        gettimeofday(&comp_t, NULL);
+        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
+        last_comp = comp_t;
+        ++completed;
+        fprintf(stderr,
+                "PGTRACE phase=AG round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
+                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
+#endif
     }
     if (handle->ctrl_mr) {
         ibv_dereg_mr(handle->ctrl_mr);
         handle->ctrl_mr = NULL;
     }
 
-    if (handle->pd) {
-        ibv_dealloc_pd(handle->pd);
-        handle->pd = NULL;
-    }
+int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
+                  size_t count, DATATYPE dtype, OPERATION op) {
+    if (!handle || !sendbuf || !recvbuf)
+        return -1;
+    pg_init_env(handle);
+
 
     if (handle->ctx) {
         ibv_close_device(handle->ctx);
@@ -221,4 +420,57 @@ void pg_close(pg_handle *handle) {
     free(handle);
 }
 
-void pg_destroy(pg_handle *handle) { pg_close(handle); }
+#ifdef PG_DEBUG
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+void check_allreduce_against_cpu(void *sendbuf, size_t count,
+                                 DATATYPE dtype, OPERATION op) {
+    if (!sendbuf)
+        return;
+
+    size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
+    /* Synthesize three ranks: local + two neighbors. */
+    int world = 3;
+
+    void *expected = malloc(count * elem_size);
+    if (!expected)
+        return;
+
+    /* Initialize expected with deterministic values for rank 0. */
+    if (dtype == DT_INT32) {
+        int32_t *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (int32_t)i;
+    } else {
+        double *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (double)i;
+    }
+
+    /* Reduce in contributions from synthetic neighbors. */
+    for (int r = 1; r < world; ++r) {
+        void *nbr = malloc(count * elem_size);
+        if (!nbr)
+            break;
+        if (dtype == DT_INT32) {
+            int32_t *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (int32_t)(i + r);
+        } else {
+            double *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (double)(i + r);
+        }
+        reduce_inplace(expected, nbr, count, dtype, op);
+        free(nbr);
+    }
+
+    if (memcmp(sendbuf, expected, count * elem_size) != 0) {
+        fprintf(stderr, "check_allreduce_against_cpu: mismatch\n");
+    }
+
+    free(expected);
+}
+#endif /* PG_DEBUG */

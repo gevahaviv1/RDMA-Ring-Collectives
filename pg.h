@@ -42,4 +42,8 @@ typedef struct {
 /* Transition both QPs to RTS using neighbor bootstrap info */
 int pg_qps_to_rts(pg_handle *handle, const qp_boot boots[2]);
 
+/* Update data window with application-provided buffers */
+int pg_set_window(pg_handle *handle, void *sendbuf, void *recvbuf,
+                  size_t bytes);
+
 #endif /* PG_H */

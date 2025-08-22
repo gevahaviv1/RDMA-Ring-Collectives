@@ -20,7 +20,18 @@ struct pg_handle {
     int bootstrap_socks[2];           /* TCP bootstrap sockets */
 
     struct ibv_mr *data_mrs[2];       /* exposed data windows */
+    void *data_bufs[2];               /* owned placeholder buffers */
+    uint32_t local_lkeys[2];          /* our lkeys */
+    uint32_t local_rkeys[2];          /* our rkeys */
+    uintptr_t local_base_addrs[2];    /* our base addresses */
+    size_t data_bytes;                /* window size */
+
     struct ibv_mr *ctrl_mr;           /* small control window */
+    void *ctrl_buf;                   /* owned control buffer */
+    uint32_t ctrl_lkey;               /* control lkey */
+    uint32_t ctrl_rkey;               /* control rkey */
+    uintptr_t ctrl_base_addr;         /* control base address */
+    size_t ctrl_bytes;                /* control region size */
 
     uint32_t neighbor_rkeys[2];       /* neighbors' rkeys */
     uintptr_t neighbor_base_addrs[2]; /* neighbors' base addresses */
@@ -100,8 +111,49 @@ pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
         goto err_qp;
     handle->max_inline_data = tmp_init.cap.max_inline_data;
 
+    handle->data_bytes = handle->chunk_bytes * handle->inflight_limit;
+    for (int i = 0; i < 2; ++i) {
+        handle->data_bufs[i] = calloc(1, handle->data_bytes);
+        if (!handle->data_bufs[i])
+            goto err_mr;
+        handle->data_mrs[i] =
+            ibv_reg_mr(handle->pd, handle->data_bufs[i], handle->data_bytes,
+                       IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                           IBV_ACCESS_REMOTE_READ);
+        if (!handle->data_mrs[i])
+            goto err_mr;
+        handle->local_lkeys[i] = handle->data_mrs[i]->lkey;
+        handle->local_rkeys[i] = handle->data_mrs[i]->rkey;
+        handle->local_base_addrs[i] = (uintptr_t)handle->data_bufs[i];
+    }
+
+    handle->ctrl_bytes = 64;
+    handle->ctrl_buf = calloc(1, handle->ctrl_bytes);
+    if (!handle->ctrl_buf)
+        goto err_mr;
+    handle->ctrl_mr =
+        ibv_reg_mr(handle->pd, handle->ctrl_buf, handle->ctrl_bytes,
+                   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                       IBV_ACCESS_REMOTE_READ);
+    if (!handle->ctrl_mr)
+        goto err_mr;
+    handle->ctrl_lkey = handle->ctrl_mr->lkey;
+    handle->ctrl_rkey = handle->ctrl_mr->rkey;
+    handle->ctrl_base_addr = (uintptr_t)handle->ctrl_buf;
+
     return handle;
 
+err_mr:
+    for (int i = 0; i < 2; ++i) {
+        if (handle->data_mrs[i])
+            ibv_dereg_mr(handle->data_mrs[i]);
+        if (handle->data_bufs[i])
+            free(handle->data_bufs[i]);
+    }
+    if (handle->ctrl_mr)
+        ibv_dereg_mr(handle->ctrl_mr);
+    if (handle->ctrl_buf)
+        free(handle->ctrl_buf);
 err_qp:
     for (int i = 0; i < 2; ++i)
         if (handle->qps[i])
@@ -120,9 +172,18 @@ err_free:
 void pg_destroy(pg_handle *handle) {
     if (!handle)
         return;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 2; ++i) {
+        if (handle->data_mrs[i])
+            ibv_dereg_mr(handle->data_mrs[i]);
+        if (handle->data_bufs[i])
+            free(handle->data_bufs[i]);
         if (handle->qps[i])
             ibv_destroy_qp(handle->qps[i]);
+    }
+    if (handle->ctrl_mr)
+        ibv_dereg_mr(handle->ctrl_mr);
+    if (handle->ctrl_buf)
+        free(handle->ctrl_buf);
     if (handle->cq)
         ibv_destroy_cq(handle->cq);
     if (handle->pd)
@@ -198,5 +259,43 @@ int pg_qps_to_rts(pg_handle *handle, const qp_boot boots[2]) {
             return -1;
     }
 
+    return 0;
+}
+
+int pg_set_window(pg_handle *handle, void *sendbuf, void *recvbuf,
+                  size_t bytes) {
+    if (!handle || !sendbuf || !recvbuf || bytes == 0)
+        return -1;
+
+    struct ibv_mr *mrs[2];
+    mrs[0] = ibv_reg_mr(handle->pd, sendbuf, bytes,
+                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                            IBV_ACCESS_REMOTE_READ);
+    if (!mrs[0])
+        return -1;
+    mrs[1] = ibv_reg_mr(handle->pd, recvbuf, bytes,
+                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                            IBV_ACCESS_REMOTE_READ);
+    if (!mrs[1]) {
+        ibv_dereg_mr(mrs[0]);
+        return -1;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->data_mrs[i])
+            ibv_dereg_mr(handle->data_mrs[i]);
+        if (handle->data_bufs[i]) {
+            free(handle->data_bufs[i]);
+            handle->data_bufs[i] = NULL;
+        }
+        handle->data_mrs[i] = mrs[i];
+    }
+    handle->local_base_addrs[0] = (uintptr_t)sendbuf;
+    handle->local_base_addrs[1] = (uintptr_t)recvbuf;
+    handle->local_lkeys[0] = handle->data_mrs[0]->lkey;
+    handle->local_lkeys[1] = handle->data_mrs[1]->lkey;
+    handle->local_rkeys[0] = handle->data_mrs[0]->rkey;
+    handle->local_rkeys[1] = handle->data_mrs[1]->rkey;
+    handle->data_bytes = bytes;
     return 0;
 }

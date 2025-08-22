@@ -4,10 +4,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 /* Forward declaration to keep tests linkable without libibverbs */
 struct ibv_cq;
 int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
+int ibv_destroy_qp(struct ibv_qp *qp);
+int ibv_destroy_cq(struct ibv_cq *cq);
+int ibv_dereg_mr(struct ibv_mr *mr);
+int ibv_dealloc_pd(struct ibv_pd *pd);
+int ibv_close_device(struct ibv_context *ctx);
 
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
 int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
@@ -223,3 +229,52 @@ int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
 
     return 0;
 }
+
+void pg_close(pg_handle *handle) {
+    if (!handle)
+        return;
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->qps[i]) {
+            ibv_destroy_qp(handle->qps[i]);
+            handle->qps[i] = NULL;
+        }
+    }
+
+    if (handle->cq) {
+        ibv_destroy_cq(handle->cq);
+        handle->cq = NULL;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->data_mrs[i]) {
+            ibv_dereg_mr(handle->data_mrs[i]);
+            handle->data_mrs[i] = NULL;
+        }
+    }
+    if (handle->ctrl_mr) {
+        ibv_dereg_mr(handle->ctrl_mr);
+        handle->ctrl_mr = NULL;
+    }
+
+    if (handle->pd) {
+        ibv_dealloc_pd(handle->pd);
+        handle->pd = NULL;
+    }
+
+    if (handle->ctx) {
+        ibv_close_device(handle->ctx);
+        handle->ctx = NULL;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->bootstrap_socks[i] >= 0) {
+            close(handle->bootstrap_socks[i]);
+            handle->bootstrap_socks[i] = -1;
+        }
+    }
+
+    free(handle);
+}
+
+void pg_destroy(pg_handle *handle) { pg_close(handle); }

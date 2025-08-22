@@ -136,6 +136,8 @@ int pg_world_size(const pg_handle *handle);
 /* Create and destroy a process group handle */
 pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
                      int inflight_limit);
+void pg_close(pg_handle *handle);
+/* Backwards compatible name */
 void pg_destroy(pg_handle *handle);
 
 /* QP bootstrap information exchanged with neighbors */

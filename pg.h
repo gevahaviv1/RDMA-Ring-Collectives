@@ -109,7 +109,6 @@ typedef struct pg_handle {
 
     union pg_ctrl_msg ctrl_recv_bufs[2][PG_CTRL_RECV_SLOTS];
     int ctrl_head[2];
-    int ctrl_tail[2];
     int rx_credits[2];
 } pg_handle;
 
@@ -117,10 +116,10 @@ typedef struct pg_handle {
 void pg_ctrl_init(pg_handle *handle);
 union pg_ctrl_msg *pg_ctrl_next_recv(pg_handle *handle, int peer);
 int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp,
-                 const void *msg, size_t len);
+                 void *msg, size_t len);
 void pg_ctrl_return_credit(pg_handle *handle, int peer);
 int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
-                     const void *msg, size_t len);
+                     void *msg, size_t len);
 int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
                   struct ibv_wc **wcs_out);
 

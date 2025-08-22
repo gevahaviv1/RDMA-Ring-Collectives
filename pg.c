@@ -14,7 +14,6 @@ struct ibv_mr;
 
 int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
 
-
 int pg_rank(const pg_handle *handle) {
     return handle ? handle->rank : -1;
 }
@@ -28,7 +27,6 @@ void pg_ctrl_init(pg_handle *handle) {
         return;
     for (int i = 0; i < 2; ++i) {
         handle->ctrl_head[i] = 0;
-        handle->ctrl_tail[i] = 0;
         handle->rx_credits[i] = PG_CTRL_RECV_SLOTS;
     }
 }
@@ -43,7 +41,7 @@ union pg_ctrl_msg *pg_ctrl_next_recv(pg_handle *handle, int peer) {
 }
 
 int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
-                     const void *msg, size_t len) {
+                     void *msg, size_t len) {
     (void)qp;
     (void)msg;
     assert(handle);
@@ -52,11 +50,11 @@ int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
 }
 
 int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp,
-                 const void *msg, size_t len) {
+                 void *msg, size_t len) {
     if (!handle || peer < 0 || peer >= 2)
         return -1;
     if (handle->rx_credits[peer] <= 0)
-        return -1; /* no credits */
+        return -1;
     int rc = post_send_inline(handle, qp, msg, len);
     if (rc == 0)
         handle->rx_credits[peer]--;
@@ -126,8 +124,7 @@ int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
         return -1;
     *wcs_out = NULL;
 
-    int capacity = min_n;
-    struct ibv_wc *wcs = malloc(sizeof(*wcs) * (size_t)capacity);
+    struct ibv_wc *wcs = malloc(sizeof(*wcs) * (size_t)min_n);
     if (!wcs)
         return -1;
 
@@ -136,7 +133,7 @@ int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
     int total = 0;
 
     while (total < min_n) {
-        int rc = ibv_poll_cq(cq, capacity - total, &wcs[total]);
+        int rc = ibv_poll_cq(cq, min_n - total, &wcs[total]);
         if (rc < 0) {
             free(wcs);
             return -1;

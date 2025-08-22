@@ -129,6 +129,9 @@ int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
                        size_t bytes, size_t eager_bytes, DATATYPE dtype,
                        OPERATION op);
 
+int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
+                      size_t count, DATATYPE dtype, OPERATION op);
+
 /* Accessors */
 int pg_rank(const pg_handle *handle);
 int pg_world_size(const pg_handle *handle);

@@ -1,11 +1,15 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -g
 LIBS = -libverbs -lpthread
+INCLUDES = -Iinclude
 
-SRCS = bootstrap.c chunk_planner.c pg.c read_engine.c reduce.c ring.c rtscts.c serverlist.c
+SRCS = src/pg.c
 OBJS = $(SRCS:.c=.o)
 
 all: libpg.a
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 libpg.a: $(OBJS)
 	ar rcs $@ $^
@@ -13,7 +17,4 @@ libpg.a: $(OBJS)
 clean:
 	rm -f $(OBJS) libpg.a
 
-format:
-	clang-format -i *.c *.h
-
-.PHONY: all clean format
+.PHONY: all clean

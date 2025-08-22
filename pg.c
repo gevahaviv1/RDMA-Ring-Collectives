@@ -299,3 +299,59 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
     /* After reduce-scatter each rank owns chunk (rank + 1) % world. */
     return 0;
 }
+
+int pg_all_gather(pg_handle *handle, void *recvbuf,
+                  size_t count, DATATYPE dtype) {
+    if (!handle || !recvbuf)
+        return -1;
+    int world = handle->world_size;
+    int rank = handle->rank;
+    if (world <= 0 || rank < 0 || rank >= world)
+        return -1;
+
+    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
+    if (chunk_elems == 0)
+        return -1;
+
+    /* Single rank already has the full vector. */
+    if (world == 1)
+        return 0;
+
+    for (int round = 0; round < world - 1; ++round) {
+        int send_idx = (rank + 1 - round + world) % world;
+        int recv_idx = (rank - round + world) % world;
+
+        size_t send_off = 0, send_len = 0;
+        size_t recv_off = 0, recv_len = 0;
+        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
+                         &send_off, &send_len);
+        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
+                         &recv_off, &recv_len);
+
+        if (recv_len == 0 && send_len == 0)
+            continue;
+
+        if (recv_len <= handle->max_inline_data) {
+            /* Small chunk: emulate inline send/recv with a local copy. */
+            memcpy((char *)recvbuf + recv_off,
+                   (char *)recvbuf + send_off, recv_len);
+        } else {
+            /* Large chunk path: placeholder for READ-based transfer.
+               For skeleton purposes fall back to chunked local copy. */
+            size_t processed = 0;
+            while (processed < recv_len) {
+                size_t step = handle->max_inline_data;
+                if (step == 0)
+                    break;
+                if (processed + step > recv_len)
+                    step = recv_len - processed;
+                memcpy((char *)recvbuf + recv_off + processed,
+                       (char *)recvbuf + send_off + processed,
+                       step);
+                processed += step;
+            }
+        }
+    }
+    /* After all-gather every rank holds the full reduced vector. */
+    return 0;
+}

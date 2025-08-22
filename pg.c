@@ -21,6 +21,46 @@ int pg_world_size(const pg_handle *handle) {
   return handle ? handle->world_size : -1;
 }
 
+static void pg_init_env(pg_handle *handle) {
+    if (!handle)
+        return;
+    const char *s;
+    if (handle->eager_max == 0) {
+        s = getenv("PG_EAGER_MAX");
+        handle->eager_max = s ? strtoul(s, NULL, 0) : PG_DEFAULT_EAGER_MAX;
+    }
+    if (handle->chunk_bytes == 0) {
+        s = getenv("PG_CHUNK_BYTES");
+        handle->chunk_bytes = s ? strtoul(s, NULL, 0) : PG_DEFAULT_CHUNK_BYTES;
+    }
+    if (handle->inflight_limit == 0) {
+        s = getenv("PG_INFLIGHT");
+        handle->inflight_limit = s ? atoi(s) : PG_DEFAULT_INFLIGHT_LIMIT;
+    }
+}
+
+#ifdef PG_DEBUG
+static long tv_diff_us(const struct timeval *a, const struct timeval *b) {
+    return (b->tv_sec - a->tv_sec) * 1000000L +
+           (b->tv_usec - a->tv_usec);
+}
+#endif
+
+pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
+                     int inflight_limit) {
+    pg_handle *h = calloc(1, sizeof(*h));
+    if (!h)
+        return NULL;
+    h->rank = rank;
+    h->world_size = world_size;
+    h->chunk_bytes = chunk_bytes;
+    h->inflight_limit = inflight_limit;
+    pg_init_env(h);
+    return h;
+}
+
+void pg_destroy(pg_handle *handle) { free(handle); }
+
 void pg_ctrl_init(pg_handle *handle) {
   if (!handle)
     return;
@@ -217,10 +257,64 @@ void pg_close(pg_handle *handle) {
     if (handle->bootstrap_socks[i] >= 0) {
       close(handle->bootstrap_socks[i]);
       handle->bootstrap_socks[i] = -1;
+
     }
   }
 
   free(handle);
 }
 
-void pg_destroy(pg_handle *handle) { pg_close(handle); }
+#ifdef PG_DEBUG
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+void check_allreduce_against_cpu(void *sendbuf, size_t count,
+                                 DATATYPE dtype, OPERATION op) {
+    if (!sendbuf)
+        return;
+
+    size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
+    /* Synthesize three ranks: local + two neighbors. */
+    int world = 3;
+
+    void *expected = malloc(count * elem_size);
+    if (!expected)
+        return;
+
+    /* Initialize expected with deterministic values for rank 0. */
+    if (dtype == DT_INT32) {
+        int32_t *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (int32_t)i;
+    } else {
+        double *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (double)i;
+    }
+
+    /* Reduce in contributions from synthetic neighbors. */
+    for (int r = 1; r < world; ++r) {
+        void *nbr = malloc(count * elem_size);
+        if (!nbr)
+            break;
+        if (dtype == DT_INT32) {
+            int32_t *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (int32_t)(i + r);
+        } else {
+            double *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (double)(i + r);
+        }
+        reduce_inplace(expected, nbr, count, dtype, op);
+        free(nbr);
+    }
+
+    if (memcmp(sendbuf, expected, count * elem_size) != 0) {
+        fprintf(stderr, "check_allreduce_against_cpu: mismatch\n");
+    }
+
+    free(expected);
+}
+#endif /* PG_DEBUG */

@@ -12,6 +12,7 @@ typedef enum { OP_SUM, OP_PROD } OPERATION;
 typedef struct pg_handle pg_handle;
 
 /* Public API */
+
 pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
                      int inflight_limit);
 void pg_close(pg_handle *handle);

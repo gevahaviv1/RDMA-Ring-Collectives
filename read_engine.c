@@ -1,4 +1,5 @@
 #include "read_engine.h"
+#include "pg.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -32,16 +33,6 @@ struct ibv_send_wr {
             uint32_t rkey;
         } rdma;
     } wr;
-};
-
-enum ibv_wc_status {
-    IBV_WC_SUCCESS = 0,
-    IBV_WC_GENERAL_ERR,
-};
-
-struct ibv_wc {
-    uint64_t wr_id;
-    enum ibv_wc_status status;
 };
 
 int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
@@ -103,8 +94,7 @@ int rdma_read_engine(uintptr_t remote_base, uint32_t remote_rkey,
         if (rc == 0)
             continue;
         if (wc.status != IBV_WC_SUCCESS) {
-            fprintf(stderr, "wc error %d on wr_id %llu\n", wc.status,
-                    (unsigned long long)wc.wr_id);
+            PG_CHECK_WC(&wc);
             return -1;
         }
         size_t chunk_id = (size_t)wc.wr_id;

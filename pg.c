@@ -5,10 +5,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 /* Forward declaration to keep tests linkable without libibverbs */
 struct ibv_cq;
 int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
+int ibv_destroy_qp(struct ibv_qp *qp);
+int ibv_destroy_cq(struct ibv_cq *cq);
+int ibv_dereg_mr(struct ibv_mr *mr);
+int ibv_dealloc_pd(struct ibv_pd *pd);
+int ibv_close_device(struct ibv_context *ctx);
 
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
 int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
@@ -58,57 +64,6 @@ void pg_ctrl_return_credit(pg_handle *handle, int peer) {
     handle->rx_credits[peer]++;
 }
 
-static const char *wc_status_str(enum ibv_wc_status status) {
-    switch (status) {
-    case IBV_WC_SUCCESS:
-        return "IBV_WC_SUCCESS";
-    case IBV_WC_LOC_LEN_ERR:
-        return "IBV_WC_LOC_LEN_ERR";
-    case IBV_WC_LOC_QP_OP_ERR:
-        return "IBV_WC_LOC_QP_OP_ERR";
-    case IBV_WC_LOC_EEC_OP_ERR:
-        return "IBV_WC_LOC_EEC_OP_ERR";
-    case IBV_WC_LOC_PROT_ERR:
-        return "IBV_WC_LOC_PROT_ERR";
-    case IBV_WC_WR_FLUSH_ERR:
-        return "IBV_WC_WR_FLUSH_ERR";
-    case IBV_WC_MW_BIND_ERR:
-        return "IBV_WC_MW_BIND_ERR";
-    case IBV_WC_BAD_RESP_ERR:
-        return "IBV_WC_BAD_RESP_ERR";
-    case IBV_WC_LOC_ACCESS_ERR:
-        return "IBV_WC_LOC_ACCESS_ERR";
-    case IBV_WC_REM_INV_REQ_ERR:
-        return "IBV_WC_REM_INV_REQ_ERR";
-    case IBV_WC_REM_ACCESS_ERR:
-        return "IBV_WC_REM_ACCESS_ERR";
-    case IBV_WC_REM_OP_ERR:
-        return "IBV_WC_REM_OP_ERR";
-    case IBV_WC_RETRY_EXC_ERR:
-        return "IBV_WC_RETRY_EXC_ERR";
-    case IBV_WC_RNR_RETRY_EXC_ERR:
-        return "IBV_WC_RNR_RETRY_EXC_ERR";
-    case IBV_WC_LOC_RDD_VIOL_ERR:
-        return "IBV_WC_LOC_RDD_VIOL_ERR";
-    case IBV_WC_REM_INV_RD_REQ_ERR:
-        return "IBV_WC_REM_INV_RD_REQ_ERR";
-    case IBV_WC_REM_ABORT_ERR:
-        return "IBV_WC_REM_ABORT_ERR";
-    case IBV_WC_INV_EECN_ERR:
-        return "IBV_WC_INV_EECN_ERR";
-    case IBV_WC_INV_EEC_STATE_ERR:
-        return "IBV_WC_INV_EEC_STATE_ERR";
-    case IBV_WC_FATAL_ERR:
-        return "IBV_WC_FATAL_ERR";
-    case IBV_WC_RESP_TIMEOUT_ERR:
-        return "IBV_WC_RESP_TIMEOUT_ERR";
-    case IBV_WC_GENERAL_ERR:
-        return "IBV_WC_GENERAL_ERR";
-    default:
-        return "IBV_WC_UNKNOWN";
-    }
-}
-
 int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
                   struct ibv_wc **wcs_out) {
     if (!cq || !wcs_out || min_n <= 0 || timeout_ms < 0)
@@ -129,14 +84,8 @@ int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
             free(wcs);
             return -1;
         }
-        for (int i = total; i < total + rc; ++i) {
-            if (wcs[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "WC error: %s (%d) wr_id=%llu\n",
-                        wc_status_str(wcs[i].status),
-                        (int)wcs[i].status,
-                        (unsigned long long)wcs[i].wr_id);
-            }
-        }
+        for (int i = total; i < total + rc; ++i)
+            PG_CHECK_WC(&wcs[i]);
         total += rc;
         if (total >= min_n)
             break;
@@ -225,162 +174,51 @@ int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
     return 0;
 }
 
-int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
-                      size_t count, DATATYPE dtype, OPERATION op) {
-    if (!handle || !sendbuf || !recvbuf)
-        return -1;
-    int world = handle->world_size;
-    int rank = handle->rank;
-    if (world <= 0 || rank < 0 || rank >= world)
-        return -1;
+void pg_close(pg_handle *handle) {
+    if (!handle)
+        return;
 
-    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
-    if (chunk_elems == 0)
-        return -1;
-
-    /* Fast path for single rank: just copy local data. */
-    if (world == 1) {
-        switch (dtype) {
-        case DT_INT32:
-            memcpy(recvbuf, sendbuf, count * sizeof(int32_t));
-            break;
-        case DT_DOUBLE:
-            memcpy(recvbuf, sendbuf, count * sizeof(double));
-            break;
-        default:
-            memcpy(recvbuf, sendbuf, count);
-            break;
-        }
-        return 0;
-    }
-
-    for (int round = 0; round < world - 1; ++round) {
-        int send_idx = rs_send_chunk_index(round, rank, world);
-        int recv_idx = rs_recv_chunk_index(round, rank, world);
-
-        size_t send_off = 0, send_len = 0;
-        size_t recv_off = 0, recv_len = 0;
-        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
-                         &send_off, &send_len);
-        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
-                         &recv_off, &recv_len);
-
-        if (recv_len == 0 && send_len == 0)
-            continue;
-
-        /* Small chunks use inline send/recv helper. */
-        if (recv_len <= handle->max_inline_data) {
-            pg_sendrecv_inline(handle,
-                               (char *)sendbuf + send_off,
-                               (char *)recvbuf + recv_off,
-                               recv_len,
-                               handle->max_inline_data,
-                               dtype, op);
-        } else {
-            /* Large chunk path: placeholder for full RTS/CTS + READ orchestration.
-               For skeleton purposes fall back to inline helper in chunks. */
-            size_t processed = 0;
-            while (processed < recv_len) {
-                size_t step = handle->max_inline_data;
-                if (step == 0) break;
-                if (processed + step > recv_len)
-                    step = recv_len - processed;
-                pg_sendrecv_inline(handle,
-                                   (char *)sendbuf + send_off + processed,
-                                   (char *)recvbuf + recv_off + processed,
-                                   step,
-                                   handle->max_inline_data,
-                                   dtype, op);
-                processed += step;
-            }
+    for (int i = 0; i < 2; ++i) {
+        if (handle->qps[i]) {
+            ibv_destroy_qp(handle->qps[i]);
+            handle->qps[i] = NULL;
         }
     }
 
-    /* After reduce-scatter each rank owns chunk (rank + 1) % world. */
-    return 0;
-}
+    if (handle->cq) {
+        ibv_destroy_cq(handle->cq);
+        handle->cq = NULL;
+    }
 
-int pg_all_gather(pg_handle *handle, void *recvbuf,
-                  size_t count, DATATYPE dtype) {
-    if (!handle || !recvbuf)
-        return -1;
-    int world = handle->world_size;
-    int rank = handle->rank;
-    if (world <= 0 || rank < 0 || rank >= world)
-        return -1;
-
-    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
-    if (chunk_elems == 0)
-        return -1;
-
-    /* Single rank already has the full vector. */
-    if (world == 1)
-        return 0;
-
-    for (int round = 0; round < world - 1; ++round) {
-        int send_idx = (rank + 1 - round + world) % world;
-        int recv_idx = (rank - round + world) % world;
-
-        size_t send_off = 0, send_len = 0;
-        size_t recv_off = 0, recv_len = 0;
-        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
-                         &send_off, &send_len);
-        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
-                         &recv_off, &recv_len);
-
-        if (recv_len == 0 && send_len == 0)
-            continue;
-
-        if (recv_len <= handle->max_inline_data) {
-            /* Small chunk: emulate inline send/recv with a local copy. */
-            memcpy((char *)recvbuf + recv_off,
-                   (char *)recvbuf + send_off, recv_len);
-        } else {
-            /* Large chunk path: placeholder for READ-based transfer.
-               For skeleton purposes fall back to chunked local copy. */
-            size_t processed = 0;
-            while (processed < recv_len) {
-                size_t step = handle->max_inline_data;
-                if (step == 0)
-                    break;
-                if (processed + step > recv_len)
-                    step = recv_len - processed;
-                memcpy((char *)recvbuf + recv_off + processed,
-                       (char *)recvbuf + send_off + processed,
-                       step);
-                processed += step;
-            }
+    for (int i = 0; i < 2; ++i) {
+        if (handle->data_mrs[i]) {
+            ibv_dereg_mr(handle->data_mrs[i]);
+            handle->data_mrs[i] = NULL;
         }
     }
-    /* After all-gather every rank holds the full reduced vector. */
-    return 0;
-}
-
-int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
-                  size_t count, DATATYPE dtype, OPERATION op) {
-    if (!handle || !sendbuf || !recvbuf)
-        return -1;
-
-    /* Validate datatype and operation combinations. */
-    switch (dtype) {
-    case DT_INT32:
-    case DT_DOUBLE:
-        break;
-    default:
-        return -1;
-    }
-    if (op != OP_SUM && op != OP_PROD)
-        return -1;
-
-    /* Out-of-place: copy sendbuf into recvbuf then operate in-place. */
-    if (sendbuf != recvbuf) {
-        size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
-        memcpy(recvbuf, sendbuf, count * elem_size);
-        sendbuf = recvbuf;
+    if (handle->ctrl_mr) {
+        ibv_dereg_mr(handle->ctrl_mr);
+        handle->ctrl_mr = NULL;
     }
 
-    int rc = pg_reduce_scatter(handle, sendbuf, recvbuf, count, dtype, op);
-    if (rc != 0)
-        return rc;
-    return pg_all_gather(handle, recvbuf, count, dtype);
+    if (handle->pd) {
+        ibv_dealloc_pd(handle->pd);
+        handle->pd = NULL;
+    }
+
+    if (handle->ctx) {
+        ibv_close_device(handle->ctx);
+        handle->ctx = NULL;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->bootstrap_socks[i] >= 0) {
+            close(handle->bootstrap_socks[i]);
+            handle->bootstrap_socks[i] = -1;
+        }
+    }
+
+    free(handle);
 }
+
+void pg_destroy(pg_handle *handle) { pg_close(handle); }

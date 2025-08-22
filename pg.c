@@ -1,4 +1,5 @@
 #include "pg.h"
+#include "chunk_planner.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>

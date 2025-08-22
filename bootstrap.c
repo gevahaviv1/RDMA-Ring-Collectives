@@ -28,6 +28,44 @@ static int set_blocking(int fd) {
     return 0;
 }
 
+static int send_all(int fd, const void *buf, size_t len, int timeout_ms) {
+    const char *p = buf;
+    while (len > 0) {
+        struct pollfd pfd = {fd, POLLOUT, 0};
+        int prc = poll(&pfd, 1, timeout_ms);
+        if (prc <= 0)
+            return -1;
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int recv_all(int fd, void *buf, size_t len, int timeout_ms) {
+    char *p = buf;
+    while (len > 0) {
+        struct pollfd pfd = {fd, POLLIN, 0};
+        int prc = poll(&pfd, 1, timeout_ms);
+        if (prc <= 0)
+            return -1;
+        ssize_t n = recv(fd, p, len, 0);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 int bootstrap_ring(const char **hosts, size_t count, size_t my_index,
                    int port_base, int timeout_ms,
                    int *fd_from_left, int *fd_to_right) {
@@ -38,6 +76,8 @@ int bootstrap_ring(const char **hosts, size_t count, size_t my_index,
     int connect_fd = -1;
     int left_fd = -1;
     int right_fd = -1;
+    struct sockaddr_storage right_addr;
+    socklen_t right_addrlen = 0;
 
     int rc = -1; /* default to failure */
 
@@ -92,10 +132,12 @@ int bootstrap_ring(const char **hosts, size_t count, size_t my_index,
             connect_fd = -1;
             continue;
         }
+        right_addrlen = p->ai_addrlen;
+        memcpy(&right_addr, p->ai_addr, p->ai_addrlen);
         if (connect(connect_fd, p->ai_addr, p->ai_addrlen) == 0) {
             right_fd = connect_fd;
-        } else if (errno == EINPROGRESS) {
-            right_fd = -1; /* will complete later */
+        } else if (errno == EINPROGRESS || errno == ECONNREFUSED) {
+            right_fd = -1; /* will complete or retry later */
         } else {
             close(connect_fd);
             connect_fd = -1;
@@ -155,11 +197,26 @@ int bootstrap_ring(const char **hosts, size_t count, size_t my_index,
             if (pfds[offset].revents & (POLLOUT | POLLERR | POLLHUP)) {
                 int err = 0;
                 socklen_t len = sizeof(err);
-                if (getsockopt(connect_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                if (getsockopt(connect_fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
                     goto out;
                 }
-                right_fd = connect_fd;
-                set_blocking(right_fd);
+                if (err != 0) {
+                    close(connect_fd);
+                    connect_fd = socket(right_addr.ss_family, SOCK_STREAM, 0);
+                    if (connect_fd < 0)
+                        goto out;
+                    if (set_nonblocking(connect_fd) < 0)
+                        goto out;
+                    if (connect(connect_fd, (struct sockaddr *)&right_addr, right_addrlen) == 0) {
+                        right_fd = connect_fd;
+                        set_blocking(right_fd);
+                    } else if (errno != EINPROGRESS && errno != ECONNREFUSED) {
+                        goto out;
+                    }
+                } else {
+                    right_fd = connect_fd;
+                    set_blocking(right_fd);
+                }
             }
         }
 
@@ -184,5 +241,22 @@ out:
     if (listen_fd >= 0) close(listen_fd);
     if (connect_fd >= 0 && connect_fd != right_fd) close(connect_fd);
     return rc;
+}
+
+int exchange_qp_boot(int fd_from_left, int fd_to_right,
+                     const struct qp_boot *mine,
+                     struct qp_boot *left, struct qp_boot *right,
+                     int timeout_ms) {
+    if (fd_from_left < 0 || fd_to_right < 0 || !mine || !left || !right)
+        return -1;
+    if (send_all(fd_to_right, mine, sizeof(*mine), timeout_ms) < 0)
+        return -1;
+    if (recv_all(fd_from_left, left, sizeof(*left), timeout_ms) < 0)
+        return -1;
+    if (send_all(fd_from_left, mine, sizeof(*mine), timeout_ms) < 0)
+        return -1;
+    if (recv_all(fd_to_right, right, sizeof(*right), timeout_ms) < 0)
+        return -1;
+    return 0;
 }
 

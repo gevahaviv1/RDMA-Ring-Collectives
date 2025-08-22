@@ -2,6 +2,7 @@
 #define BOOTSTRAP_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /*
  * Establish a pair of TCP connections forming a ring.
@@ -19,5 +20,33 @@
 int bootstrap_ring(const char **hosts, size_t count, size_t my_index,
                    int port_base, int timeout_ms,
                    int *fd_from_left, int *fd_to_right);
+
+/* Packed exchange structure for QP bootstrap */
+struct qp_boot {
+    uint32_t qpn;
+    uint32_t psn;
+    uint16_t lid;
+    uint8_t gid[16];
+    uint64_t base_addr;
+    uint32_t rkey;
+    uint64_t bytes;
+} __attribute__((packed));
+
+/*
+ * Exchange qp_boot blobs with both neighbors.
+ *
+ * fd_from_left: socket connected to left neighbor.
+ * fd_to_right:  socket connected to right neighbor.
+ * mine:         information to send.
+ * left:         on success, info received from left neighbor.
+ * right:        on success, info received from right neighbor.
+ * timeout_ms:   poll timeout for each send/recv attempt.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+int exchange_qp_boot(int fd_from_left, int fd_to_right,
+                     const struct qp_boot *mine,
+                     struct qp_boot *left, struct qp_boot *right,
+                     int timeout_ms);
 
 #endif /* BOOTSTRAP_H */

@@ -1,10 +1,9 @@
-#include "pg.h"
 #include "chunk_planner.h"
-#include "reduce.h"
+#include "pg_internal.h"
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -18,7 +17,9 @@ int ibv_dealloc_pd(struct ibv_pd *pd);
 int ibv_close_device(struct ibv_context *ctx);
 
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
-int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
+int pg_world_size(const pg_handle *handle) {
+  return handle ? handle->world_size : -1;
+}
 
 static void pg_init_env(pg_handle *handle) {
     if (!handle)
@@ -61,363 +62,206 @@ pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
 void pg_destroy(pg_handle *handle) { free(handle); }
 
 void pg_ctrl_init(pg_handle *handle) {
-    if (!handle)
-        return;
-    for (int i = 0; i < 2; ++i) {
-        handle->ctrl_head[i] = 0;
-        handle->rx_credits[i] = PG_CTRL_RECV_SLOTS;
-    }
+  if (!handle)
+    return;
+  for (int i = 0; i < 2; ++i) {
+    handle->ctrl_head[i] = 0;
+    handle->rx_credits[i] = PG_CTRL_RECV_SLOTS;
+  }
 }
 
 union pg_ctrl_msg *pg_ctrl_next_recv(pg_handle *handle, int peer) {
-    if (!handle || peer < 0 || peer >= 2)
-        return NULL;
-    int idx = handle->ctrl_head[peer];
-    union pg_ctrl_msg *slot = &handle->ctrl_recv_bufs[peer][idx];
-    handle->ctrl_head[peer] = (idx + 1) % PG_CTRL_RECV_SLOTS;
-    return slot;
+  if (!handle || peer < 0 || peer >= 2)
+    return NULL;
+  int idx = handle->ctrl_head[peer];
+  union pg_ctrl_msg *slot = &handle->ctrl_recv_bufs[peer][idx];
+  handle->ctrl_head[peer] = (idx + 1) % PG_CTRL_RECV_SLOTS;
+  return slot;
 }
 
-int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
-                     void *msg, size_t len) {
-    (void)qp;
-    (void)msg;
-    assert(handle);
-    assert(len <= handle->max_inline_data);
-    return 0;
+int post_send_inline(pg_handle *handle, struct ibv_qp *qp, void *msg,
+                     size_t len) {
+  (void)qp;
+  (void)msg;
+  assert(handle);
+  assert(len <= handle->max_inline_data);
+  return 0;
 }
 
-int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp,
-                 void *msg, size_t len) {
-    if (!handle || peer < 0 || peer >= 2)
-        return -1;
-    if (handle->rx_credits[peer] <= 0)
-        return -1;
-    int rc = post_send_inline(handle, qp, msg, len);
-    if (rc == 0)
-        handle->rx_credits[peer]--;
-    return rc;
+int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp, void *msg,
+                 size_t len) {
+  if (!handle || peer < 0 || peer >= 2)
+    return -1;
+  if (handle->rx_credits[peer] <= 0)
+    return -1;
+  int rc = post_send_inline(handle, qp, msg, len);
+  if (rc == 0)
+    handle->rx_credits[peer]--;
+  return rc;
 }
 
 void pg_ctrl_return_credit(pg_handle *handle, int peer) {
-    if (!handle || peer < 0 || peer >= 2)
-        return;
-    handle->rx_credits[peer]++;
+  if (!handle || peer < 0 || peer >= 2)
+    return;
+  handle->rx_credits[peer]++;
 }
 
 int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
                   struct ibv_wc **wcs_out) {
-    if (!cq || !wcs_out || min_n <= 0 || timeout_ms < 0)
-        return -1;
-    *wcs_out = NULL;
+  if (!cq || !wcs_out || min_n <= 0 || timeout_ms < 0)
+    return -1;
+  *wcs_out = NULL;
 
-    struct ibv_wc *wcs = malloc(sizeof(*wcs) * (size_t)min_n);
-    if (!wcs)
-        return -1;
+  struct ibv_wc *wcs = malloc(sizeof(*wcs) * (size_t)min_n);
+  if (!wcs)
+    return -1;
 
-    struct timeval start;
-    gettimeofday(&start, NULL);
-    int total = 0;
+  struct timeval start;
+  gettimeofday(&start, NULL);
+  int total = 0;
 
-    while (total < min_n) {
-        int rc = ibv_poll_cq(cq, min_n - total, &wcs[total]);
-        if (rc < 0) {
-            free(wcs);
-            return -1;
-        }
-        for (int i = total; i < total + rc; ++i)
-            PG_CHECK_WC(&wcs[i]);
-        total += rc;
-        if (total >= min_n)
-            break;
-
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
-                          (now.tv_usec - start.tv_usec) / 1000L;
-        if (elapsed_ms >= timeout_ms)
-            break;
+  while (total < min_n) {
+    int rc = ibv_poll_cq(cq, min_n - total, &wcs[total]);
+    if (rc < 0) {
+      free(wcs);
+      return -1;
     }
+    for (int i = total; i < total + rc; ++i)
+      PG_CHECK_WC(&wcs[i]);
+    total += rc;
+    if (total >= min_n)
+      break;
 
-    if (total == 0) {
-        free(wcs);
-    } else {
-        *wcs_out = wcs;
-    }
-    return total;
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
+                      (now.tv_usec - start.tv_usec) / 1000L;
+    if (elapsed_ms >= timeout_ms)
+      break;
+  }
+
+  if (total == 0) {
+    free(wcs);
+  } else {
+    *wcs_out = wcs;
+  }
+  return total;
 }
 
 int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
                        size_t bytes, size_t eager_bytes, DATATYPE dtype,
                        OPERATION op) {
-    if (!handle || !sendbuf || !recvbuf)
-        return -1;
-    if (bytes > eager_bytes || bytes > handle->max_inline_data)
-        return -1;
+  if (!handle || !sendbuf || !recvbuf)
+    return -1;
+  if (bytes > eager_bytes || bytes > handle->max_inline_data)
+    return -1;
 
-    int rc = post_send_inline(handle, handle->qps[1], sendbuf, bytes);
-    if (rc != 0)
-        return rc;
+  int rc = post_send_inline(handle, handle->qps[1], sendbuf, bytes);
+  if (rc != 0)
+    return rc;
 
-    struct ibv_wc *wc = NULL;
-    rc = poll_cq_until(handle->cq, 1, 1000, &wc);
-    if (rc < 1) {
-        free(wc);
-        return -1;
-    }
+  struct ibv_wc *wc = NULL;
+  rc = poll_cq_until(handle->cq, 1, 1000, &wc);
+  if (rc < 1) {
     free(wc);
+    return -1;
+  }
+  free(wc);
 
-    size_t count;
-    switch (dtype) {
-    case DT_INT32: {
-        count = bytes / sizeof(int32_t);
-        int32_t *dst = (int32_t *)recvbuf;
-        int32_t *src = (int32_t *)sendbuf;
-        if (op == OP_SUM) {
-            for (size_t i = 0; i < count; ++i)
-                dst[i] += src[i];
-        } else if (op == OP_PROD) {
-            for (size_t i = 0; i < count; ++i)
-                dst[i] *= src[i];
-        } else {
-            memcpy(dst, src, count * sizeof(int32_t));
-        }
-        size_t rem = bytes % sizeof(int32_t);
-        if (rem)
-            memcpy((char *)dst + count * sizeof(int32_t),
-                   (char *)src + count * sizeof(int32_t), rem);
-        break;
+  size_t count;
+  switch (dtype) {
+  case DT_INT32: {
+    count = bytes / sizeof(int32_t);
+    int32_t *dst = (int32_t *)recvbuf;
+    int32_t *src = (int32_t *)sendbuf;
+    if (op == OP_SUM) {
+      for (size_t i = 0; i < count; ++i)
+        dst[i] += src[i];
+    } else if (op == OP_PROD) {
+      for (size_t i = 0; i < count; ++i)
+        dst[i] *= src[i];
+    } else {
+      memcpy(dst, src, count * sizeof(int32_t));
     }
-    case DT_DOUBLE: {
-        count = bytes / sizeof(double);
-        double *dst = (double *)recvbuf;
-        double *src = (double *)sendbuf;
-        if (op == OP_SUM) {
-            for (size_t i = 0; i < count; ++i)
-                dst[i] += src[i];
-        } else if (op == OP_PROD) {
-            for (size_t i = 0; i < count; ++i)
-                dst[i] *= src[i];
-        } else {
-            memcpy(dst, src, count * sizeof(double));
-        }
-        size_t rem = bytes % sizeof(double);
-        if (rem)
-            memcpy((char *)dst + count * sizeof(double),
-                   (char *)src + count * sizeof(double), rem);
-        break;
+    size_t rem = bytes % sizeof(int32_t);
+    if (rem)
+      memcpy((char *)dst + count * sizeof(int32_t),
+             (char *)src + count * sizeof(int32_t), rem);
+    break;
+  }
+  case DT_DOUBLE: {
+    count = bytes / sizeof(double);
+    double *dst = (double *)recvbuf;
+    double *src = (double *)sendbuf;
+    if (op == OP_SUM) {
+      for (size_t i = 0; i < count; ++i)
+        dst[i] += src[i];
+    } else if (op == OP_PROD) {
+      for (size_t i = 0; i < count; ++i)
+        dst[i] *= src[i];
+    } else {
+      memcpy(dst, src, count * sizeof(double));
     }
-    default:
-        memcpy(recvbuf, sendbuf, bytes);
-        break;
-    }
+    size_t rem = bytes % sizeof(double);
+    if (rem)
+      memcpy((char *)dst + count * sizeof(double),
+             (char *)src + count * sizeof(double), rem);
+    break;
+  }
+  default:
+    memcpy(recvbuf, sendbuf, bytes);
+    break;
+  }
 
-    return 0;
+  return 0;
 }
 
-int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
-                      size_t count, DATATYPE dtype, OPERATION op) {
-    if (!handle || !sendbuf || !recvbuf)
-        return -1;
-    pg_init_env(handle);
-    int world = handle->world_size;
-    int rank = handle->rank;
-    if (world <= 0 || rank < 0 || rank >= world)
-        return -1;
+void pg_close(pg_handle *handle) {
+  if (!handle)
+    return;
 
-    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
-    if (chunk_elems == 0)
-        return -1;
-
-
-    for (int i = 0; i < 2; ++i) {
-        if (handle->qps[i]) {
-            ibv_destroy_qp(handle->qps[i]);
-            handle->qps[i] = NULL;
-        }
+  for (int i = 0; i < 2; ++i) {
+    if (handle->qps[i]) {
+      ibv_destroy_qp(handle->qps[i]);
+      handle->qps[i] = NULL;
     }
+  }
 
-    size_t eager_limit = handle->eager_max;
-    if (eager_limit > handle->max_inline_data)
-        eager_limit = handle->max_inline_data;
+  if (handle->cq) {
+    ibv_destroy_cq(handle->cq);
+    handle->cq = NULL;
+  }
 
-#ifdef PG_DEBUG
-    size_t posted = 0, completed = 0;
-    struct timeval last_post = {0}, last_comp = {0};
-#endif
-
-    for (int round = 0; round < world - 1; ++round) {
-        int send_idx = rs_send_chunk_index(round, rank, world);
-        int recv_idx = rs_recv_chunk_index(round, rank, world);
-
-        size_t send_off = 0, send_len = 0;
-        size_t recv_off = 0, recv_len = 0;
-        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
-                         &send_off, &send_len);
-        rs_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
-                         &recv_off, &recv_len);
-
-        if (recv_len == 0 && send_len == 0)
-            continue;
-
-#ifdef PG_DEBUG
-        struct timeval post_t;
-        gettimeofday(&post_t, NULL);
-        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
-        last_post = post_t;
-        ++posted;
-#endif
-
-        /* Small chunks use inline send/recv helper. */
-        if (recv_len <= eager_limit) {
-            pg_sendrecv_inline(handle,
-                               (char *)sendbuf + send_off,
-                               (char *)recvbuf + recv_off,
-                               recv_len,
-                               eager_limit,
-                               dtype, op);
-        } else {
-            /* Large chunk path: placeholder for full RTS/CTS + READ orchestration.
-               For skeleton purposes fall back to inline helper in chunks. */
-            size_t processed = 0;
-            while (processed < recv_len) {
-                size_t step = handle->max_inline_data;
-                if (step == 0) break;
-                if (processed + step > recv_len)
-                    step = recv_len - processed;
-                pg_sendrecv_inline(handle,
-                                   (char *)sendbuf + send_off + processed,
-                                   (char *)recvbuf + recv_off + processed,
-                                   step,
-                                   handle->max_inline_data,
-                                   dtype, op);
-                processed += step;
-            }
-        }
-
-#ifdef PG_DEBUG
-        struct timeval comp_t;
-        gettimeofday(&comp_t, NULL);
-        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
-        last_comp = comp_t;
-        ++completed;
-        fprintf(stderr,
-                "PGTRACE phase=RS round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
-                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
-#endif
+  for (int i = 0; i < 2; ++i) {
+    if (handle->data_mrs[i]) {
+      ibv_dereg_mr(handle->data_mrs[i]);
+      handle->data_mrs[i] = NULL;
     }
+  }
+  if (handle->ctrl_mr) {
+    ibv_dereg_mr(handle->ctrl_mr);
+    handle->ctrl_mr = NULL;
+  }
 
-    /* After reduce-scatter each rank owns chunk (rank + 1) % world. */
-    return 0;
-}
+  if (handle->pd) {
+    ibv_dealloc_pd(handle->pd);
+    handle->pd = NULL;
+  }
 
-int pg_all_gather(pg_handle *handle, void *recvbuf,
-                  size_t count, DATATYPE dtype) {
-    if (!handle || !recvbuf)
-        return -1;
-    pg_init_env(handle);
-    int world = handle->world_size;
-    int rank = handle->rank;
-    if (world <= 0 || rank < 0 || rank >= world)
-        return -1;
+  if (handle->ctx) {
+    ibv_close_device(handle->ctx);
+    handle->ctx = NULL;
+  }
 
-    size_t chunk_elems = chunk_elems_from_bytes(handle->chunk_bytes, dtype);
-    if (chunk_elems == 0)
-        return -1;
+  for (int i = 0; i < 2; ++i) {
+    if (handle->bootstrap_socks[i] >= 0) {
+      close(handle->bootstrap_socks[i]);
+      handle->bootstrap_socks[i] = -1;
 
-    /* Single rank already has the full vector. */
-    if (world == 1)
-        return 0;
-
-    size_t eager_limit = handle->eager_max;
-    if (eager_limit > handle->max_inline_data)
-        eager_limit = handle->max_inline_data;
-
-#ifdef PG_DEBUG
-    size_t posted = 0, completed = 0;
-    struct timeval last_post = {0}, last_comp = {0};
-#endif
-
-    for (int round = 0; round < world - 1; ++round) {
-        int send_idx = (rank + 1 - round + world) % world;
-        int recv_idx = (rank - round + world) % world;
-
-        size_t send_off = 0, send_len = 0;
-        size_t recv_off = 0, recv_len = 0;
-        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)send_idx,
-                         &send_off, &send_len);
-        ag_chunk_offsets(count, chunk_elems, dtype, (size_t)recv_idx,
-                         &recv_off, &recv_len);
-
-        if (recv_len == 0 && send_len == 0)
-            continue;
-
-#ifdef PG_DEBUG
-        struct timeval post_t;
-        gettimeofday(&post_t, NULL);
-        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
-        last_post = post_t;
-        ++posted;
-#endif
-
-        if (recv_len <= eager_limit) {
-            /* Small chunk: emulate inline send/recv with a local copy. */
-            memcpy((char *)recvbuf + recv_off,
-                   (char *)recvbuf + send_off, recv_len);
-        } else {
-            /* Large chunk path: placeholder for READ-based transfer.
-               For skeleton purposes fall back to chunked local copy. */
-            size_t processed = 0;
-            while (processed < recv_len) {
-                size_t step = handle->max_inline_data;
-                if (step == 0)
-                    break;
-                if (processed + step > recv_len)
-                    step = recv_len - processed;
-                memcpy((char *)recvbuf + recv_off + processed,
-                       (char *)recvbuf + send_off + processed,
-                       step);
-                processed += step;
-            }
-
-        }
-
-#ifdef PG_DEBUG
-        struct timeval comp_t;
-        gettimeofday(&comp_t, NULL);
-        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
-        last_comp = comp_t;
-        ++completed;
-        fprintf(stderr,
-                "PGTRACE phase=AG round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
-                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
-#endif
     }
-    if (handle->ctrl_mr) {
-        ibv_dereg_mr(handle->ctrl_mr);
-        handle->ctrl_mr = NULL;
-    }
+  }
 
-int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
-                  size_t count, DATATYPE dtype, OPERATION op) {
-    if (!handle || !sendbuf || !recvbuf)
-        return -1;
-    pg_init_env(handle);
-
-
-    if (handle->ctx) {
-        ibv_close_device(handle->ctx);
-        handle->ctx = NULL;
-    }
-
-    for (int i = 0; i < 2; ++i) {
-        if (handle->bootstrap_socks[i] >= 0) {
-            close(handle->bootstrap_socks[i]);
-            handle->bootstrap_socks[i] = -1;
-        }
-    }
-
-    free(handle);
+  free(handle);
 }
 
 #ifdef PG_DEBUG

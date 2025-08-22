@@ -27,4 +27,9 @@ typedef struct pg_handle pg_handle;
 int pg_rank(const pg_handle *handle);
 int pg_world_size(const pg_handle *handle);
 
+/* Create and destroy a process group handle */
+pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
+                     int inflight_limit);
+void pg_destroy(pg_handle *handle);
+
 #endif /* PG_H */

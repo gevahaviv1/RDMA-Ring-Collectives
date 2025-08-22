@@ -44,6 +44,68 @@ struct ibv_wc {
 };
 #endif /* INFINIBAND_VERBS_H */
 
+static inline const char *pg_wc_status_str(enum ibv_wc_status status) {
+    switch (status) {
+    case IBV_WC_SUCCESS:
+        return "IBV_WC_SUCCESS";
+    case IBV_WC_LOC_LEN_ERR:
+        return "IBV_WC_LOC_LEN_ERR";
+    case IBV_WC_LOC_QP_OP_ERR:
+        return "IBV_WC_LOC_QP_OP_ERR";
+    case IBV_WC_LOC_EEC_OP_ERR:
+        return "IBV_WC_LOC_EEC_OP_ERR";
+    case IBV_WC_LOC_PROT_ERR:
+        return "IBV_WC_LOC_PROT_ERR";
+    case IBV_WC_WR_FLUSH_ERR:
+        return "IBV_WC_WR_FLUSH_ERR";
+    case IBV_WC_MW_BIND_ERR:
+        return "IBV_WC_MW_BIND_ERR";
+    case IBV_WC_BAD_RESP_ERR:
+        return "IBV_WC_BAD_RESP_ERR";
+    case IBV_WC_LOC_ACCESS_ERR:
+        return "IBV_WC_LOC_ACCESS_ERR";
+    case IBV_WC_REM_INV_REQ_ERR:
+        return "IBV_WC_REM_INV_REQ_ERR";
+    case IBV_WC_REM_ACCESS_ERR:
+        return "IBV_WC_REM_ACCESS_ERR";
+    case IBV_WC_REM_OP_ERR:
+        return "IBV_WC_REM_OP_ERR";
+    case IBV_WC_RETRY_EXC_ERR:
+        return "IBV_WC_RETRY_EXC_ERR";
+    case IBV_WC_RNR_RETRY_EXC_ERR:
+        return "IBV_WC_RNR_RETRY_EXC_ERR";
+    case IBV_WC_LOC_RDD_VIOL_ERR:
+        return "IBV_WC_LOC_RDD_VIOL_ERR";
+    case IBV_WC_REM_INV_RD_REQ_ERR:
+        return "IBV_WC_REM_INV_RD_REQ_ERR";
+    case IBV_WC_REM_ABORT_ERR:
+        return "IBV_WC_REM_ABORT_ERR";
+    case IBV_WC_INV_EECN_ERR:
+        return "IBV_WC_INV_EECN_ERR";
+    case IBV_WC_INV_EEC_STATE_ERR:
+        return "IBV_WC_INV_EEC_STATE_ERR";
+    case IBV_WC_FATAL_ERR:
+        return "IBV_WC_FATAL_ERR";
+    case IBV_WC_RESP_TIMEOUT_ERR:
+        return "IBV_WC_RESP_TIMEOUT_ERR";
+    case IBV_WC_GENERAL_ERR:
+        return "IBV_WC_GENERAL_ERR";
+    default:
+        return "IBV_WC_UNKNOWN";
+    }
+}
+
+#define PG_CHECK_WC(wc_ptr)                                                  \
+    do {                                                                     \
+        if ((wc_ptr)->status != IBV_WC_SUCCESS) {                            \
+            fprintf(stderr,                                                 \
+                    "WC error: %s (%d) wr_id=%llu\n",                       \
+                    pg_wc_status_str((wc_ptr)->status),                     \
+                    (int)(wc_ptr)->status,                                  \
+                    (unsigned long long)(wc_ptr)->wr_id);                   \
+        }                                                                    \
+    } while (0)
+
 /* Datatype identifiers */
 typedef enum {
     DT_INT32,

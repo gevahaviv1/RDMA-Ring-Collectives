@@ -14,6 +14,11 @@ int parse_server_list(const char *serverlist,
         return -1;
     }
 
+    /* initialize outputs in case of early error */
+    *hosts_out = NULL;
+    *num_hosts_out = 0;
+    *my_index_out = 0;
+
     char **hosts = NULL;
     size_t count = 0;
     ssize_t my_rank = -1;

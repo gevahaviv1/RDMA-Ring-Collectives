@@ -32,6 +32,8 @@ static void test_host_not_found(void) {
     int rc = parse_server_list(servers, "host3", &hosts, &count, &my_index);
     assert(rc == -1);
     assert(hosts == NULL);
+    assert(count == 0);
+    assert(my_index == 0);
 }
 
 int main(void) {

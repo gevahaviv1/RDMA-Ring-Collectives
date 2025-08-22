@@ -1,5 +1,7 @@
 #include "pg.h"
 
+#include <assert.h>
+
 /* Forward declarations for RDMA structures to avoid external dependencies */
 struct ibv_context;
 struct ibv_pd;
@@ -7,31 +9,6 @@ struct ibv_cq;
 struct ibv_qp;
 struct ibv_mr;
 
-struct pg_handle {
-    struct ibv_context *ctx;          /* device context */
-    struct ibv_pd *pd;                /* protection domain */
-    struct ibv_cq *cq;                /* completion queue */
-    struct ibv_qp *qps[2];            /* two queue pairs */
-    uint32_t max_inline_data;         /* inline threshold */
-
-    int rank;                         /* rank in communicator */
-    int world_size;                   /* total participants */
-    int left_index;                   /* neighbor to the left */
-    int right_index;                  /* neighbor to the right */
-
-    int bootstrap_socks[2];           /* TCP bootstrap sockets */
-
-    struct ibv_mr *data_mrs[2];       /* exposed data windows */
-    struct ibv_mr *ctrl_mr;           /* small control window */
-
-    uint32_t neighbor_rkeys[2];       /* neighbors' rkeys */
-    uintptr_t neighbor_base_addrs[2]; /* neighbors' base addresses */
-
-    size_t chunk_bytes;               /* pipeline chunk size */
-    int inflight_limit;               /* maximum inflight operations */
-
-    int rx_credits[2];                /* receive credit counters */
-};
 
 int pg_rank(const pg_handle *handle) {
     return handle ? handle->rank : -1;
@@ -39,4 +16,50 @@ int pg_rank(const pg_handle *handle) {
 
 int pg_world_size(const pg_handle *handle) {
     return handle ? handle->world_size : -1;
+}
+
+void pg_ctrl_init(pg_handle *handle) {
+    if (!handle)
+        return;
+    for (int i = 0; i < 2; ++i) {
+        handle->ctrl_head[i] = 0;
+        handle->ctrl_tail[i] = 0;
+        handle->rx_credits[i] = PG_CTRL_RECV_SLOTS;
+    }
+}
+
+union pg_ctrl_msg *pg_ctrl_next_recv(pg_handle *handle, int peer) {
+    if (!handle || peer < 0 || peer >= 2)
+        return NULL;
+    int idx = handle->ctrl_head[peer];
+    union pg_ctrl_msg *slot = &handle->ctrl_recv_bufs[peer][idx];
+    handle->ctrl_head[peer] = (idx + 1) % PG_CTRL_RECV_SLOTS;
+    return slot;
+}
+
+int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
+                     const void *msg, size_t len) {
+    (void)qp;
+    (void)msg;
+    assert(handle);
+    assert(len <= handle->max_inline_data);
+    return 0;
+}
+
+int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp,
+                 const void *msg, size_t len) {
+    if (!handle || peer < 0 || peer >= 2)
+        return -1;
+    if (handle->rx_credits[peer] <= 0)
+        return -1; /* no credits */
+    int rc = post_send_inline(handle, qp, msg, len);
+    if (rc == 0)
+        handle->rx_credits[peer]--;
+    return rc;
+}
+
+void pg_ctrl_return_credit(pg_handle *handle, int peer) {
+    if (!handle || peer < 0 || peer >= 2)
+        return;
+    handle->rx_credits[peer]++;
 }

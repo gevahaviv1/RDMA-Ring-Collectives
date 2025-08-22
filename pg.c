@@ -355,3 +355,32 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
     /* After all-gather every rank holds the full reduced vector. */
     return 0;
 }
+
+int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
+                  size_t count, DATATYPE dtype, OPERATION op) {
+    if (!handle || !sendbuf || !recvbuf)
+        return -1;
+
+    /* Validate datatype and operation combinations. */
+    switch (dtype) {
+    case DT_INT32:
+    case DT_DOUBLE:
+        break;
+    default:
+        return -1;
+    }
+    if (op != OP_SUM && op != OP_PROD)
+        return -1;
+
+    /* Out-of-place: copy sendbuf into recvbuf then operate in-place. */
+    if (sendbuf != recvbuf) {
+        size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
+        memcpy(recvbuf, sendbuf, count * elem_size);
+        sendbuf = recvbuf;
+    }
+
+    int rc = pg_reduce_scatter(handle, sendbuf, recvbuf, count, dtype, op);
+    if (rc != 0)
+        return rc;
+    return pg_all_gather(handle, recvbuf, count, dtype);
+}

@@ -135,6 +135,9 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
 int pg_all_gather(pg_handle *handle, void *recvbuf,
                   size_t count, DATATYPE dtype);
 
+int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
+                  size_t count, DATATYPE dtype, OPERATION op);
+
 /* Accessors */
 int pg_rank(const pg_handle *handle);
 int pg_world_size(const pg_handle *handle);

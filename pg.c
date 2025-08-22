@@ -6,10 +6,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 /* Forward declaration to keep tests linkable without libibverbs */
 struct ibv_cq;
 int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
+int ibv_destroy_qp(struct ibv_qp *qp);
+int ibv_destroy_cq(struct ibv_cq *cq);
+int ibv_dereg_mr(struct ibv_mr *mr);
+int ibv_dealloc_pd(struct ibv_pd *pd);
+int ibv_close_device(struct ibv_context *ctx);
 
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
 int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
@@ -99,57 +105,6 @@ void pg_ctrl_return_credit(pg_handle *handle, int peer) {
     handle->rx_credits[peer]++;
 }
 
-static const char *wc_status_str(enum ibv_wc_status status) {
-    switch (status) {
-    case IBV_WC_SUCCESS:
-        return "IBV_WC_SUCCESS";
-    case IBV_WC_LOC_LEN_ERR:
-        return "IBV_WC_LOC_LEN_ERR";
-    case IBV_WC_LOC_QP_OP_ERR:
-        return "IBV_WC_LOC_QP_OP_ERR";
-    case IBV_WC_LOC_EEC_OP_ERR:
-        return "IBV_WC_LOC_EEC_OP_ERR";
-    case IBV_WC_LOC_PROT_ERR:
-        return "IBV_WC_LOC_PROT_ERR";
-    case IBV_WC_WR_FLUSH_ERR:
-        return "IBV_WC_WR_FLUSH_ERR";
-    case IBV_WC_MW_BIND_ERR:
-        return "IBV_WC_MW_BIND_ERR";
-    case IBV_WC_BAD_RESP_ERR:
-        return "IBV_WC_BAD_RESP_ERR";
-    case IBV_WC_LOC_ACCESS_ERR:
-        return "IBV_WC_LOC_ACCESS_ERR";
-    case IBV_WC_REM_INV_REQ_ERR:
-        return "IBV_WC_REM_INV_REQ_ERR";
-    case IBV_WC_REM_ACCESS_ERR:
-        return "IBV_WC_REM_ACCESS_ERR";
-    case IBV_WC_REM_OP_ERR:
-        return "IBV_WC_REM_OP_ERR";
-    case IBV_WC_RETRY_EXC_ERR:
-        return "IBV_WC_RETRY_EXC_ERR";
-    case IBV_WC_RNR_RETRY_EXC_ERR:
-        return "IBV_WC_RNR_RETRY_EXC_ERR";
-    case IBV_WC_LOC_RDD_VIOL_ERR:
-        return "IBV_WC_LOC_RDD_VIOL_ERR";
-    case IBV_WC_REM_INV_RD_REQ_ERR:
-        return "IBV_WC_REM_INV_RD_REQ_ERR";
-    case IBV_WC_REM_ABORT_ERR:
-        return "IBV_WC_REM_ABORT_ERR";
-    case IBV_WC_INV_EECN_ERR:
-        return "IBV_WC_INV_EECN_ERR";
-    case IBV_WC_INV_EEC_STATE_ERR:
-        return "IBV_WC_INV_EEC_STATE_ERR";
-    case IBV_WC_FATAL_ERR:
-        return "IBV_WC_FATAL_ERR";
-    case IBV_WC_RESP_TIMEOUT_ERR:
-        return "IBV_WC_RESP_TIMEOUT_ERR";
-    case IBV_WC_GENERAL_ERR:
-        return "IBV_WC_GENERAL_ERR";
-    default:
-        return "IBV_WC_UNKNOWN";
-    }
-}
-
 int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
                   struct ibv_wc **wcs_out) {
     if (!cq || !wcs_out || min_n <= 0 || timeout_ms < 0)
@@ -170,14 +125,8 @@ int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
             free(wcs);
             return -1;
         }
-        for (int i = total; i < total + rc; ++i) {
-            if (wcs[i].status != IBV_WC_SUCCESS) {
-                fprintf(stderr, "WC error: %s (%d) wr_id=%llu\n",
-                        wc_status_str(wcs[i].status),
-                        (int)wcs[i].status,
-                        (unsigned long long)wcs[i].wr_id);
-            }
-        }
+        for (int i = total; i < total + rc; ++i)
+            PG_CHECK_WC(&wcs[i]);
         total += rc;
         if (total >= min_n)
             break;
@@ -280,20 +229,12 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
     if (chunk_elems == 0)
         return -1;
 
-    /* Fast path for single rank: just copy local data. */
-    if (world == 1) {
-        switch (dtype) {
-        case DT_INT32:
-            memcpy(recvbuf, sendbuf, count * sizeof(int32_t));
-            break;
-        case DT_DOUBLE:
-            memcpy(recvbuf, sendbuf, count * sizeof(double));
-            break;
-        default:
-            memcpy(recvbuf, sendbuf, count);
-            break;
+
+    for (int i = 0; i < 2; ++i) {
+        if (handle->qps[i]) {
+            ibv_destroy_qp(handle->qps[i]);
+            handle->qps[i] = NULL;
         }
-        return 0;
     }
 
     size_t eager_limit = handle->eager_max;
@@ -438,6 +379,7 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
                        step);
                 processed += step;
             }
+
         }
 
 #ifdef PG_DEBUG
@@ -451,9 +393,10 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
                 round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
 #endif
     }
-    /* After all-gather every rank holds the full reduced vector. */
-    return 0;
-}
+    if (handle->ctrl_mr) {
+        ibv_dereg_mr(handle->ctrl_mr);
+        handle->ctrl_mr = NULL;
+    }
 
 int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
                   size_t count, DATATYPE dtype, OPERATION op) {
@@ -461,28 +404,20 @@ int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
         return -1;
     pg_init_env(handle);
 
-    /* Validate datatype and operation combinations. */
-    switch (dtype) {
-    case DT_INT32:
-    case DT_DOUBLE:
-        break;
-    default:
-        return -1;
-    }
-    if (op != OP_SUM && op != OP_PROD)
-        return -1;
 
-    /* Out-of-place: copy sendbuf into recvbuf then operate in-place. */
-    if (sendbuf != recvbuf) {
-        size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
-        memcpy(recvbuf, sendbuf, count * elem_size);
-        sendbuf = recvbuf;
+    if (handle->ctx) {
+        ibv_close_device(handle->ctx);
+        handle->ctx = NULL;
     }
 
-    int rc = pg_reduce_scatter(handle, sendbuf, recvbuf, count, dtype, op);
-    if (rc != 0)
-        return rc;
-    return pg_all_gather(handle, recvbuf, count, dtype);
+    for (int i = 0; i < 2; ++i) {
+        if (handle->bootstrap_socks[i] >= 0) {
+            close(handle->bootstrap_socks[i]);
+            handle->bootstrap_socks[i] = -1;
+        }
+    }
+
+    free(handle);
 }
 
 #ifdef PG_DEBUG

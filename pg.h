@@ -57,6 +57,7 @@ typedef enum {
 } OPERATION;
 
 /* Default pipeline thresholds */
+#define PG_DEFAULT_EAGER_MAX 4096
 #define PG_DEFAULT_CHUNK_BYTES 4096
 #define PG_DEFAULT_INFLIGHT_LIMIT 4
 
@@ -108,6 +109,7 @@ typedef struct pg_handle {
 
     size_t chunk_bytes;
     int inflight_limit;
+    size_t eager_max;
 
     union pg_ctrl_msg ctrl_recv_bufs[2][PG_CTRL_RECV_SLOTS];
     int ctrl_head[2];

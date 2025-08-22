@@ -14,6 +14,46 @@ int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc);
 int pg_rank(const pg_handle *handle) { return handle ? handle->rank : -1; }
 int pg_world_size(const pg_handle *handle) { return handle ? handle->world_size : -1; }
 
+static void pg_init_env(pg_handle *handle) {
+    if (!handle)
+        return;
+    const char *s;
+    if (handle->eager_max == 0) {
+        s = getenv("PG_EAGER_MAX");
+        handle->eager_max = s ? strtoul(s, NULL, 0) : PG_DEFAULT_EAGER_MAX;
+    }
+    if (handle->chunk_bytes == 0) {
+        s = getenv("PG_CHUNK_BYTES");
+        handle->chunk_bytes = s ? strtoul(s, NULL, 0) : PG_DEFAULT_CHUNK_BYTES;
+    }
+    if (handle->inflight_limit == 0) {
+        s = getenv("PG_INFLIGHT");
+        handle->inflight_limit = s ? atoi(s) : PG_DEFAULT_INFLIGHT_LIMIT;
+    }
+}
+
+#ifdef PG_DEBUG
+static long tv_diff_us(const struct timeval *a, const struct timeval *b) {
+    return (b->tv_sec - a->tv_sec) * 1000000L +
+           (b->tv_usec - a->tv_usec);
+}
+#endif
+
+pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
+                     int inflight_limit) {
+    pg_handle *h = calloc(1, sizeof(*h));
+    if (!h)
+        return NULL;
+    h->rank = rank;
+    h->world_size = world_size;
+    h->chunk_bytes = chunk_bytes;
+    h->inflight_limit = inflight_limit;
+    pg_init_env(h);
+    return h;
+}
+
+void pg_destroy(pg_handle *handle) { free(handle); }
+
 void pg_ctrl_init(pg_handle *handle) {
     if (!handle)
         return;
@@ -230,6 +270,7 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
                       size_t count, DATATYPE dtype, OPERATION op) {
     if (!handle || !sendbuf || !recvbuf)
         return -1;
+    pg_init_env(handle);
     int world = handle->world_size;
     int rank = handle->rank;
     if (world <= 0 || rank < 0 || rank >= world)
@@ -255,6 +296,15 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
         return 0;
     }
 
+    size_t eager_limit = handle->eager_max;
+    if (eager_limit > handle->max_inline_data)
+        eager_limit = handle->max_inline_data;
+
+#ifdef PG_DEBUG
+    size_t posted = 0, completed = 0;
+    struct timeval last_post = {0}, last_comp = {0};
+#endif
+
     for (int round = 0; round < world - 1; ++round) {
         int send_idx = rs_send_chunk_index(round, rank, world);
         int recv_idx = rs_recv_chunk_index(round, rank, world);
@@ -269,13 +319,21 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
         if (recv_len == 0 && send_len == 0)
             continue;
 
+#ifdef PG_DEBUG
+        struct timeval post_t;
+        gettimeofday(&post_t, NULL);
+        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
+        last_post = post_t;
+        ++posted;
+#endif
+
         /* Small chunks use inline send/recv helper. */
-        if (recv_len <= handle->max_inline_data) {
+        if (recv_len <= eager_limit) {
             pg_sendrecv_inline(handle,
                                (char *)sendbuf + send_off,
                                (char *)recvbuf + recv_off,
                                recv_len,
-                               handle->max_inline_data,
+                               eager_limit,
                                dtype, op);
         } else {
             /* Large chunk path: placeholder for full RTS/CTS + READ orchestration.
@@ -295,6 +353,17 @@ int pg_reduce_scatter(pg_handle *handle, void *sendbuf, void *recvbuf,
                 processed += step;
             }
         }
+
+#ifdef PG_DEBUG
+        struct timeval comp_t;
+        gettimeofday(&comp_t, NULL);
+        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
+        last_comp = comp_t;
+        ++completed;
+        fprintf(stderr,
+                "PGTRACE phase=RS round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
+                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
+#endif
     }
 
     /* After reduce-scatter each rank owns chunk (rank + 1) % world. */
@@ -305,6 +374,7 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
                   size_t count, DATATYPE dtype) {
     if (!handle || !recvbuf)
         return -1;
+    pg_init_env(handle);
     int world = handle->world_size;
     int rank = handle->rank;
     if (world <= 0 || rank < 0 || rank >= world)
@@ -317,6 +387,15 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
     /* Single rank already has the full vector. */
     if (world == 1)
         return 0;
+
+    size_t eager_limit = handle->eager_max;
+    if (eager_limit > handle->max_inline_data)
+        eager_limit = handle->max_inline_data;
+
+#ifdef PG_DEBUG
+    size_t posted = 0, completed = 0;
+    struct timeval last_post = {0}, last_comp = {0};
+#endif
 
     for (int round = 0; round < world - 1; ++round) {
         int send_idx = (rank + 1 - round + world) % world;
@@ -332,7 +411,15 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
         if (recv_len == 0 && send_len == 0)
             continue;
 
-        if (recv_len <= handle->max_inline_data) {
+#ifdef PG_DEBUG
+        struct timeval post_t;
+        gettimeofday(&post_t, NULL);
+        long post_delta = posted ? tv_diff_us(&last_post, &post_t) : 0;
+        last_post = post_t;
+        ++posted;
+#endif
+
+        if (recv_len <= eager_limit) {
             /* Small chunk: emulate inline send/recv with a local copy. */
             memcpy((char *)recvbuf + recv_off,
                    (char *)recvbuf + send_off, recv_len);
@@ -352,6 +439,17 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
                 processed += step;
             }
         }
+
+#ifdef PG_DEBUG
+        struct timeval comp_t;
+        gettimeofday(&comp_t, NULL);
+        long comp_delta = completed ? tv_diff_us(&last_comp, &comp_t) : 0;
+        last_comp = comp_t;
+        ++completed;
+        fprintf(stderr,
+                "PGTRACE phase=AG round=%d chunk=%d bytes=%zu posted=%zu completed=%zu dt_post=%ldus dt_comp=%ldus\n",
+                round, recv_idx, recv_len, posted, completed, post_delta, comp_delta);
+#endif
     }
     /* After all-gather every rank holds the full reduced vector. */
     return 0;
@@ -361,6 +459,7 @@ int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
                   size_t count, DATATYPE dtype, OPERATION op) {
     if (!handle || !sendbuf || !recvbuf)
         return -1;
+    pg_init_env(handle);
 
     /* Validate datatype and operation combinations. */
     switch (dtype) {

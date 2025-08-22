@@ -11,7 +11,8 @@ struct ibv_cq;
 struct ibv_qp;
 struct ibv_mr;
 
-/* Minimal stand-ins for ibverbs completion types */
+/* Minimal stand-ins for ibverbs completion types when the real header is absent */
+#ifndef INFINIBAND_VERBS_H
 enum ibv_wc_status {
     IBV_WC_SUCCESS = 0,
     IBV_WC_LOC_LEN_ERR,
@@ -41,6 +42,7 @@ struct ibv_wc {
     uint64_t wr_id;
     enum ibv_wc_status status;
 };
+#endif /* INFINIBAND_VERBS_H */
 
 /* Datatype identifiers */
 typedef enum {
@@ -122,6 +124,10 @@ int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
                      void *msg, size_t len);
 int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
                   struct ibv_wc **wcs_out);
+
+int pg_sendrecv_inline(pg_handle *handle, void *sendbuf, void *recvbuf,
+                       size_t bytes, size_t eager_bytes, DATATYPE dtype,
+                       OPERATION op);
 
 /* Accessors */
 int pg_rank(const pg_handle *handle);

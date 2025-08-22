@@ -32,4 +32,14 @@ pg_handle *pg_create(int rank, int world_size, size_t chunk_bytes,
                      int inflight_limit);
 void pg_destroy(pg_handle *handle);
 
+/* QP bootstrap information exchanged with neighbors */
+typedef struct {
+    uint32_t qpn;
+    uint16_t lid;      /* 0 when using gid */
+    uint8_t gid[16];   /* all zeros when using lid */
+} qp_boot;
+
+/* Transition both QPs to RTS using neighbor bootstrap info */
+int pg_qps_to_rts(pg_handle *handle, const qp_boot boots[2]);
+
 #endif /* PG_H */

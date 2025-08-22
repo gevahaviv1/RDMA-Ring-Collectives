@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <string.h>
 #include <infiniband/verbs.h>
 
 #include "pg.h"
@@ -129,4 +130,73 @@ void pg_destroy(pg_handle *handle) {
     if (handle->ctx)
         ibv_close_device(handle->ctx);
     free(handle);
+}
+
+int pg_qps_to_rts(pg_handle *handle, const qp_boot boots[2]) {
+    if (!handle || !boots)
+        return -1;
+
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(handle->ctx, 1, &port_attr))
+        return -1;
+    enum ibv_mtu mtu = port_attr.active_mtu;
+
+    for (int i = 0; i < 2; ++i) {
+        struct ibv_qp *qp = handle->qps[i];
+        if (!qp)
+            return -1;
+
+        struct ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_INIT;
+        attr.pkey_index = 0;
+        attr.port_num = 1;
+        attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE |
+                               IBV_ACCESS_REMOTE_READ |
+                               IBV_ACCESS_LOCAL_WRITE;
+        int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                    IBV_QP_ACCESS_FLAGS;
+        if (ibv_modify_qp(qp, &attr, flags))
+            return -1;
+
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RTR;
+        attr.path_mtu = mtu;
+        attr.dest_qp_num = boots[i].qpn;
+        attr.rq_psn = 0;
+        attr.max_dest_rd_atomic = 1;
+        attr.min_rnr_timer = 12;
+        attr.ah_attr.port_num = 1;
+        if (boots[i].lid) {
+            attr.ah_attr.is_global = 0;
+            attr.ah_attr.dlid = boots[i].lid;
+        } else {
+            union ibv_gid gid;
+            memcpy(&gid, boots[i].gid, sizeof(gid));
+            attr.ah_attr.is_global = 1;
+            attr.ah_attr.grh.dgid = gid;
+            attr.ah_attr.grh.sgid_index = 0;
+            attr.ah_attr.grh.hop_limit = 1;
+        }
+        flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+        if (ibv_modify_qp(qp, &attr, flags))
+            return -1;
+
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_RTS;
+        attr.timeout = 14;
+        attr.retry_cnt = 7;
+        attr.rnr_retry = 7;
+        attr.sq_psn = 0;
+        attr.max_rd_atomic = 1;
+        flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                IBV_QP_MAX_QP_RD_ATOMIC;
+        if (ibv_modify_qp(qp, &attr, flags))
+            return -1;
+    }
+
+    return 0;
 }

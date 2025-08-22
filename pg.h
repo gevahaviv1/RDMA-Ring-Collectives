@@ -11,6 +11,37 @@ struct ibv_cq;
 struct ibv_qp;
 struct ibv_mr;
 
+/* Minimal stand-ins for ibverbs completion types */
+enum ibv_wc_status {
+    IBV_WC_SUCCESS = 0,
+    IBV_WC_LOC_LEN_ERR,
+    IBV_WC_LOC_QP_OP_ERR,
+    IBV_WC_LOC_EEC_OP_ERR,
+    IBV_WC_LOC_PROT_ERR,
+    IBV_WC_WR_FLUSH_ERR,
+    IBV_WC_MW_BIND_ERR,
+    IBV_WC_BAD_RESP_ERR,
+    IBV_WC_LOC_ACCESS_ERR,
+    IBV_WC_REM_INV_REQ_ERR,
+    IBV_WC_REM_ACCESS_ERR,
+    IBV_WC_REM_OP_ERR,
+    IBV_WC_RETRY_EXC_ERR,
+    IBV_WC_RNR_RETRY_EXC_ERR,
+    IBV_WC_LOC_RDD_VIOL_ERR,
+    IBV_WC_REM_INV_RD_REQ_ERR,
+    IBV_WC_REM_ABORT_ERR,
+    IBV_WC_INV_EECN_ERR,
+    IBV_WC_INV_EEC_STATE_ERR,
+    IBV_WC_FATAL_ERR,
+    IBV_WC_RESP_TIMEOUT_ERR,
+    IBV_WC_GENERAL_ERR,
+};
+
+struct ibv_wc {
+    uint64_t wr_id;
+    enum ibv_wc_status status;
+};
+
 /* Datatype identifiers */
 typedef enum {
     DT_INT32,
@@ -90,6 +121,8 @@ int pg_ctrl_send(pg_handle *handle, int peer, struct ibv_qp *qp,
 void pg_ctrl_return_credit(pg_handle *handle, int peer);
 int post_send_inline(pg_handle *handle, struct ibv_qp *qp,
                      const void *msg, size_t len);
+int poll_cq_until(struct ibv_cq *cq, int min_n, int timeout_ms,
+                  struct ibv_wc **wcs_out);
 
 /* Accessors */
 int pg_rank(const pg_handle *handle);

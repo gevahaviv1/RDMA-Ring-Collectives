@@ -2,6 +2,11 @@
 #include <assert.h>
 #include <stdio.h>
 
+struct ibv_cq { int dummy; };
+int ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc) {
+    (void)cq; (void)num_entries; (void)wc; return 0;
+}
+
 int main(void) {
     /* verify packed sizes */
     assert(sizeof(struct pg_msg_rts) == 8);

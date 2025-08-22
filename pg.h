@@ -138,6 +138,11 @@ int pg_all_gather(pg_handle *handle, void *recvbuf,
 int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
                   size_t count, DATATYPE dtype, OPERATION op);
 
+#ifdef PG_DEBUG
+void check_allreduce_against_cpu(void *sendbuf, size_t count,
+                                 DATATYPE dtype, OPERATION op);
+#endif
+
 /* Accessors */
 int pg_rank(const pg_handle *handle);
 int pg_world_size(const pg_handle *handle);

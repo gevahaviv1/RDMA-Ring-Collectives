@@ -1,5 +1,6 @@
 #include "pg.h"
 #include "chunk_planner.h"
+#include "reduce.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -384,3 +385,58 @@ int pg_all_reduce(pg_handle *handle, void *sendbuf, void *recvbuf,
         return rc;
     return pg_all_gather(handle, recvbuf, count, dtype);
 }
+
+#ifdef PG_DEBUG
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+void check_allreduce_against_cpu(void *sendbuf, size_t count,
+                                 DATATYPE dtype, OPERATION op) {
+    if (!sendbuf)
+        return;
+
+    size_t elem_size = (dtype == DT_INT32) ? sizeof(int32_t) : sizeof(double);
+    /* Synthesize three ranks: local + two neighbors. */
+    int world = 3;
+
+    void *expected = malloc(count * elem_size);
+    if (!expected)
+        return;
+
+    /* Initialize expected with deterministic values for rank 0. */
+    if (dtype == DT_INT32) {
+        int32_t *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (int32_t)i;
+    } else {
+        double *e = expected;
+        for (size_t i = 0; i < count; ++i)
+            e[i] = (double)i;
+    }
+
+    /* Reduce in contributions from synthetic neighbors. */
+    for (int r = 1; r < world; ++r) {
+        void *nbr = malloc(count * elem_size);
+        if (!nbr)
+            break;
+        if (dtype == DT_INT32) {
+            int32_t *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (int32_t)(i + r);
+        } else {
+            double *n = nbr;
+            for (size_t i = 0; i < count; ++i)
+                n[i] = (double)(i + r);
+        }
+        reduce_inplace(expected, nbr, count, dtype, op);
+        free(nbr);
+    }
+
+    if (memcmp(sendbuf, expected, count * elem_size) != 0) {
+        fprintf(stderr, "check_allreduce_against_cpu: mismatch\n");
+    }
+
+    free(expected);
+}
+#endif /* PG_DEBUG */

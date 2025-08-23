@@ -1,4 +1,4 @@
-# RDMA Ring Collectives (Exercise 3)
+# RDMA Ring Collectives
 
 ## Project Overview
 Single-process-per-host library for Reduce-Scatter → All-Gather → All-Reduce on an RDMA ring.

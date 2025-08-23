@@ -1,17 +1,17 @@
 #include "pg.h"
 
 #include <ctype.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #define PG_DEFAULT_EAGER_MAX 4096
 #define PG_DEFAULT_CHUNK_BYTES 4096
@@ -40,8 +40,9 @@ struct pg {
   uint32_t max_inline_data;
 };
 
-// Initialize pg fields from environment variables (PG_EAGER_MAX, PG_CHUNK_BYTES,
-// PG_INFLIGHT) if they are zero-initialized; otherwise keep existing values.
+// Initialize pg fields from environment variables (PG_EAGER_MAX,
+// PG_CHUNK_BYTES, PG_INFLIGHT) if they are zero-initialized; otherwise keep
+// existing values.
 static void pg_init_env(struct pg *pg) {
   const char *s;
 
@@ -61,7 +62,8 @@ static void pg_init_env(struct pg *pg) {
   }
 }
 
-// Return the size in bytes of one element of the given DATATYPE; 0 if unsupported.
+// Return the size in bytes of one element of the given DATATYPE; 0 if
+// unsupported.
 static size_t elem_size(DATATYPE dt) {
   switch (dt) {
     case DT_INT32:
@@ -73,8 +75,8 @@ static size_t elem_size(DATATYPE dt) {
   }
 }
 
-// Given a chunk size in bytes and datatype, compute how many whole elements fit.
-// Returns at least 1 when dt is supported; returns 0 if dt is invalid.
+// Given a chunk size in bytes and datatype, compute how many whole elements
+// fit. Returns at least 1 when dt is supported; returns 0 if dt is invalid.
 static size_t chunk_elems_from_bytes(size_t chunk_bytes, DATATYPE dt) {
   size_t es = elem_size(dt);
 
@@ -176,6 +178,7 @@ static int parse_server_list(const char *list, const char *me, size_t *n_out,
 
     const char *start = p;
     while (*p && !isspace((unsigned char)*p)) p++;
+
     size_t len = (size_t)(p - start);
     size_t me_len = strlen(me);
     if (idx == (size_t)-1 &&
@@ -215,6 +218,8 @@ static int parse_server_list(const char *list, const char *me, size_t *n_out,
   return 0;
 }
 
+// Write exactly 'len' bytes from 'buf' to socket 'fd', handling short writes
+// and EINTR. Returns 0 on success, -1 on error.
 static int write_full(int fd, const void *buf, size_t len) {
   const char *p = buf;
   while (len) {
@@ -223,12 +228,15 @@ static int write_full(int fd, const void *buf, size_t len) {
       if (n < 0 && errno == EINTR) continue;
       return -1;
     }
+
     p += n;
     len -= (size_t)n;
   }
   return 0;
 }
 
+// Read exactly 'len' bytes into 'buf' from socket 'fd', handling short reads
+// and EINTR. Returns 0 on success, -1 on error/EOF.
 static int read_full(int fd, void *buf, size_t len) {
   char *p = buf;
   while (len) {
@@ -237,12 +245,16 @@ static int read_full(int fd, void *buf, size_t len) {
       if (n < 0 && errno == EINTR) continue;
       return -1;
     }
+
     p += n;
     len -= (size_t)n;
   }
   return 0;
 }
 
+// Exchange bootstrap queue-pair info with a peer over socket 'fd'. If
+// 'send_first' is non-zero, send then receive; otherwise receive then send.
+// Returns 0 on success, -1 on error.
 static int exchange_qp(int fd, const struct qp_boot *local,
                        struct qp_boot *remote, int send_first) {
   if (send_first) {
@@ -255,9 +267,108 @@ static int exchange_qp(int fd, const struct qp_boot *local,
   return 0;
 }
 
+// Establish ring connections to left/right peers and exchange bootstrap info.
+// Uses pg->hosts, pg->rank, pg->world, pg->port. Fills pg->left_qp,
+// pg->right_qp and pg->max_inline_data. Returns 0 on success, -1 on failure.
+static int ring_connect(struct pg *pg) {
+  int right = (pg->rank + 1) % pg->world;
+
+  struct addrinfo hints, *ai = NULL;
+  char portstr[16];
+  snprintf(portstr, sizeof(portstr), "%d", pg->port);
+
+  int listen_fd = -1, conn_fd = -1, left_fd = -1, right_fd = -1;
+
+  // Setup passive listen socket
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+  if (getaddrinfo(NULL, portstr, &hints, &ai) != 0) goto fail;
+
+  listen_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (listen_fd < 0) goto fail;
+
+  fcntl(listen_fd, F_SETFL, O_NONBLOCK);
+  if (bind(listen_fd, ai->ai_addr, ai->ai_addrlen) != 0) goto fail;
+  if (listen(listen_fd, 1) != 0) goto fail;
+  freeaddrinfo(ai);
+  ai = NULL;
+
+  // Initiate non-blocking connect to right neighbor
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(pg->hosts[right], portstr, &hints, &ai) != 0) goto fail;
+
+  conn_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+  if (conn_fd < 0) goto fail;
+
+  fcntl(conn_fd, F_SETFL, O_NONBLOCK);
+  int rc = connect(conn_fd, ai->ai_addr, ai->ai_addrlen);
+  if (rc != 0 && errno != EINPROGRESS) goto fail;
+  freeaddrinfo(ai);
+  ai = NULL;
+
+  // Poll until both incoming (left) and outgoing (right) are ready
+  struct pollfd pfds[2];
+  pfds[0].fd = listen_fd;
+  pfds[0].events = POLLIN;
+  pfds[1].fd = conn_fd;
+  pfds[1].events = POLLOUT;
+  int timeout_ms = 10000;
+
+  while (left_fd < 0 || right_fd < 0) {
+    rc = poll(pfds, 2, timeout_ms);
+    if (rc <= 0) goto fail;
+
+    if (left_fd < 0 && (pfds[0].revents & POLLIN)) {
+      left_fd = accept(listen_fd, NULL, NULL);
+      if (left_fd >= 0) {
+        int fl = fcntl(left_fd, F_GETFL, 0);
+        fcntl(left_fd, F_SETFL, fl & ~O_NONBLOCK);
+      }
+    }
+
+    if (right_fd < 0 && (pfds[1].revents & POLLOUT)) {
+      int err = 0;
+      socklen_t errlen = sizeof(err);
+      if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err)
+        goto fail;
+      right_fd = conn_fd;
+      int fl = fcntl(right_fd, F_GETFL, 0);
+      fcntl(right_fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+  }
+
+  close(listen_fd);
+  listen_fd = -1;
+
+  // Exchange bootstrap info with neighbors
+  struct qp_boot myinfo;
+  memset(&myinfo, 0, sizeof(myinfo));
+  if (exchange_qp(left_fd, &myinfo, &pg->left_qp, 0) != 0) goto fail;
+  if (exchange_qp(right_fd, &myinfo, &pg->right_qp, 1) != 0) goto fail;
+
+  close(left_fd);
+  close(right_fd);
+  left_fd = right_fd = -1;
+  pg->max_inline_data = 0;
+  return 0;
+
+fail:
+  if (listen_fd >= 0) close(listen_fd);
+  if (conn_fd >= 0 && conn_fd != right_fd) close(conn_fd);
+  if (left_fd >= 0) close(left_fd);
+  if (right_fd >= 0) close(right_fd);
+  if (ai) freeaddrinfo(ai);
+  return -1;
+}
+
 // Initialize a process group using a whitespace-separated 'serverlist'.
 // Determines this host's rank and world size, applies environment overrides,
-// and returns an opaque handle via 'out_handle'.
+// and returns an opaque handle via 'out_handle'. Establishes a TCP ring when
+// world > 1.
 int connect_process_group(const char *serverlist, void **out_handle) {
   if (!serverlist || !out_handle) return -1;
 
@@ -280,93 +391,17 @@ int connect_process_group(const char *serverlist, void **out_handle) {
   pg->hosts = hosts;
   pg_init_env(pg);
 
-  int left = (pg->rank - 1 + pg->world) % pg->world;
-  int right = (pg->rank + 1) % pg->world;
-  (void)left;
-
   const char *ps = getenv("PG_PORT");
   pg->port = ps ? atoi(ps) : 18515;
 
-  int listen_fd = -1, conn_fd = -1, left_fd = -1, right_fd = -1;
   if (pg->world > 1) {
-    struct addrinfo hints, *ai = NULL;
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%d", pg->port);
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-    if (getaddrinfo(NULL, portstr, &hints, &ai) != 0) goto fail;
-    listen_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (listen_fd < 0) goto fail;
-    fcntl(listen_fd, F_SETFL, O_NONBLOCK);
-    if (bind(listen_fd, ai->ai_addr, ai->ai_addrlen) != 0) goto fail;
-    if (listen(listen_fd, 1) != 0) goto fail;
-    freeaddrinfo(ai);
-    ai = NULL;
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(pg->hosts[right], portstr, &hints, &ai) != 0) goto fail;
-    conn_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (conn_fd < 0) goto fail;
-    fcntl(conn_fd, F_SETFL, O_NONBLOCK);
-    int rc = connect(conn_fd, ai->ai_addr, ai->ai_addrlen);
-    if (rc != 0 && errno != EINPROGRESS) goto fail;
-    freeaddrinfo(ai);
-
-    struct pollfd pfds[2];
-    pfds[0].fd = listen_fd;
-    pfds[0].events = POLLIN;
-    pfds[1].fd = conn_fd;
-    pfds[1].events = POLLOUT;
-    int timeout_ms = 10000;
-
-    while (left_fd < 0 || right_fd < 0) {
-      rc = poll(pfds, 2, timeout_ms);
-      if (rc <= 0) goto fail;
-      if (left_fd < 0 && (pfds[0].revents & POLLIN)) {
-        left_fd = accept(listen_fd, NULL, NULL);
-        if (left_fd >= 0) {
-          int fl = fcntl(left_fd, F_GETFL, 0);
-          fcntl(left_fd, F_SETFL, fl & ~O_NONBLOCK);
-        }
-      }
-      if (right_fd < 0 && (pfds[1].revents & POLLOUT)) {
-        int err = 0;
-        socklen_t errlen = sizeof(err);
-        if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err)
-          goto fail;
-        right_fd = conn_fd;
-        int fl = fcntl(right_fd, F_GETFL, 0);
-        fcntl(right_fd, F_SETFL, fl & ~O_NONBLOCK);
-      }
-    }
-
-    close(listen_fd);
-    listen_fd = -1;
-
-    struct qp_boot myinfo;
-    memset(&myinfo, 0, sizeof(myinfo));
-    if (exchange_qp(left_fd, &myinfo, &pg->left_qp, 0) != 0) goto fail;
-    if (exchange_qp(right_fd, &myinfo, &pg->right_qp, 1) != 0) goto fail;
-
-    close(left_fd);
-    close(right_fd);
-    left_fd = right_fd = -1;
-    pg->max_inline_data = 0;
+    if (ring_connect(pg) != 0) goto fail;
   }
 
   *out_handle = pg;
   return 0;
 
 fail:
-  if (listen_fd >= 0) close(listen_fd);
-  if (conn_fd >= 0 && conn_fd != right_fd) close(conn_fd);
-  if (left_fd >= 0) close(left_fd);
-  if (right_fd >= 0) close(right_fd);
   if (hosts) {
     for (size_t i = 0; i < n; ++i) free(hosts[i]);
     free(hosts);
@@ -379,10 +414,12 @@ fail:
 int pg_close(void *pg_handle) {
   struct pg *pg = pg_handle;
   if (!pg) return 0;
+
   if (pg->hosts) {
     for (int i = 0; i < pg->world; ++i) free(pg->hosts[i]);
     free(pg->hosts);
   }
+
   free(pg);
   return 0;
 }

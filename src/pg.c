@@ -13,37 +13,12 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define PG_DEFAULT_EAGER_MAX 4096
-#define PG_DEFAULT_CHUNK_BYTES 4096
-#define PG_DEFAULT_INFLIGHT 4
-
-struct qp_boot {
-  uint32_t qpn;
-  uint32_t psn;
-  uint8_t gid[16];
-  uint64_t addr;
-  uint32_t rkey;
-  uint32_t bytes;
-};
-
-struct pg {
-  int rank;
-  int world;
-  size_t chunk_bytes;
-  size_t eager_max;
-  int inflight;
-
-  char **hosts;
-  int port;
-  struct qp_boot left_qp;
-  struct qp_boot right_qp;
-  uint32_t max_inline_data;
-};
+#include "pg_internal.h"
 
 // Initialize pg fields from environment variables (PG_EAGER_MAX,
 // PG_CHUNK_BYTES, PG_INFLIGHT) if they are zero-initialized; otherwise keep
 // existing values.
-static void pg_init_env(struct pg *pg) {
+void pg_init_env(struct pg *pg) {
   const char *s;
 
   if (!pg->eager_max) {
@@ -218,152 +193,7 @@ static int parse_server_list(const char *list, const char *me, size_t *n_out,
   return 0;
 }
 
-// Write exactly 'len' bytes from 'buf' to socket 'fd', handling short writes
-// and EINTR. Returns 0 on success, -1 on error.
-static int write_full(int fd, const void *buf, size_t len) {
-  const char *p = buf;
-  while (len) {
-    ssize_t n = send(fd, p, len, 0);
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) continue;
-      return -1;
-    }
-
-    p += n;
-    len -= (size_t)n;
-  }
-  return 0;
-}
-
-// Read exactly 'len' bytes into 'buf' from socket 'fd', handling short reads
-// and EINTR. Returns 0 on success, -1 on error/EOF.
-static int read_full(int fd, void *buf, size_t len) {
-  char *p = buf;
-  while (len) {
-    ssize_t n = recv(fd, p, len, 0);
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) continue;
-      return -1;
-    }
-
-    p += n;
-    len -= (size_t)n;
-  }
-  return 0;
-}
-
-// Exchange bootstrap queue-pair info with a peer over socket 'fd'. If
-// 'send_first' is non-zero, send then receive; otherwise receive then send.
-// Returns 0 on success, -1 on error.
-static int exchange_qp(int fd, const struct qp_boot *local,
-                       struct qp_boot *remote, int send_first) {
-  if (send_first) {
-    if (write_full(fd, local, sizeof(*local)) != 0) return -1;
-    if (read_full(fd, remote, sizeof(*remote)) != 0) return -1;
-  } else {
-    if (read_full(fd, remote, sizeof(*remote)) != 0) return -1;
-    if (write_full(fd, local, sizeof(*local)) != 0) return -1;
-  }
-  return 0;
-}
-
-// Establish ring connections to left/right peers and exchange bootstrap info.
-// Uses pg->hosts, pg->rank, pg->world, pg->port. Fills pg->left_qp,
-// pg->right_qp and pg->max_inline_data. Returns 0 on success, -1 on failure.
-static int ring_connect(struct pg *pg) {
-  int right = (pg->rank + 1) % pg->world;
-
-  struct addrinfo hints, *ai = NULL;
-  char portstr[16];
-  snprintf(portstr, sizeof(portstr), "%d", pg->port);
-
-  int listen_fd = -1, conn_fd = -1, left_fd = -1, right_fd = -1;
-
-  // Setup passive listen socket
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-  if (getaddrinfo(NULL, portstr, &hints, &ai) != 0) goto fail;
-
-  listen_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-  if (listen_fd < 0) goto fail;
-
-  fcntl(listen_fd, F_SETFL, O_NONBLOCK);
-  if (bind(listen_fd, ai->ai_addr, ai->ai_addrlen) != 0) goto fail;
-  if (listen(listen_fd, 1) != 0) goto fail;
-  freeaddrinfo(ai);
-  ai = NULL;
-
-  // Initiate non-blocking connect to right neighbor
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  if (getaddrinfo(pg->hosts[right], portstr, &hints, &ai) != 0) goto fail;
-
-  conn_fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-  if (conn_fd < 0) goto fail;
-
-  fcntl(conn_fd, F_SETFL, O_NONBLOCK);
-  int rc = connect(conn_fd, ai->ai_addr, ai->ai_addrlen);
-  if (rc != 0 && errno != EINPROGRESS) goto fail;
-  freeaddrinfo(ai);
-  ai = NULL;
-
-  // Poll until both incoming (left) and outgoing (right) are ready
-  struct pollfd pfds[2];
-  pfds[0].fd = listen_fd;
-  pfds[0].events = POLLIN;
-  pfds[1].fd = conn_fd;
-  pfds[1].events = POLLOUT;
-  int timeout_ms = 10000;
-
-  while (left_fd < 0 || right_fd < 0) {
-    rc = poll(pfds, 2, timeout_ms);
-    if (rc <= 0) goto fail;
-
-    if (left_fd < 0 && (pfds[0].revents & POLLIN)) {
-      left_fd = accept(listen_fd, NULL, NULL);
-      if (left_fd >= 0) {
-        int fl = fcntl(left_fd, F_GETFL, 0);
-        fcntl(left_fd, F_SETFL, fl & ~O_NONBLOCK);
-      }
-    }
-
-    if (right_fd < 0 && (pfds[1].revents & POLLOUT)) {
-      int err = 0;
-      socklen_t errlen = sizeof(err);
-      if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err)
-        goto fail;
-      right_fd = conn_fd;
-      int fl = fcntl(right_fd, F_GETFL, 0);
-      fcntl(right_fd, F_SETFL, fl & ~O_NONBLOCK);
-    }
-  }
-
-  close(listen_fd);
-  listen_fd = -1;
-
-  // Exchange bootstrap info with neighbors
-  struct qp_boot myinfo;
-  memset(&myinfo, 0, sizeof(myinfo));
-  if (exchange_qp(left_fd, &myinfo, &pg->left_qp, 0) != 0) goto fail;
-  if (exchange_qp(right_fd, &myinfo, &pg->right_qp, 1) != 0) goto fail;
-
-  close(left_fd);
-  close(right_fd);
-  left_fd = right_fd = -1;
-  pg->max_inline_data = 0;
-  return 0;
-
-fail:
-  if (listen_fd >= 0) close(listen_fd);
-  if (conn_fd >= 0 && conn_fd != right_fd) close(conn_fd);
-  if (left_fd >= 0) close(left_fd);
-  if (right_fd >= 0) close(right_fd);
-  if (ai) freeaddrinfo(ai);
-  return -1;
-}
+// (networking helpers moved to src/pg_net.c)
 
 // Initialize a process group using a whitespace-separated 'serverlist'.
 // Determines this host's rank and world size, applies environment overrides,

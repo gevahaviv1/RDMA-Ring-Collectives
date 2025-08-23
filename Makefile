@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -O2 -g
 LIBS = -libverbs -lpthread
 INCLUDES = -Iinclude
 
-SRCS = src/pg.c
+SRCS = src/pg.c src/pg_net.c
 OBJS = $(SRCS:.c=.o)
 
 all: libpg.a

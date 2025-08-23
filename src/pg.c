@@ -18,6 +18,8 @@ struct pg {
   int inflight;
 };
 
+// Initialize pg fields from environment variables (PG_EAGER_MAX, PG_CHUNK_BYTES,
+// PG_INFLIGHT) if they are zero-initialized; otherwise keep existing values.
 static void pg_init_env(struct pg *pg) {
   const char *s;
 
@@ -37,6 +39,7 @@ static void pg_init_env(struct pg *pg) {
   }
 }
 
+// Return the size in bytes of one element of the given DATATYPE; 0 if unsupported.
 static size_t elem_size(DATATYPE dt) {
   switch (dt) {
     case DT_INT32:
@@ -48,6 +51,8 @@ static size_t elem_size(DATATYPE dt) {
   }
 }
 
+// Given a chunk size in bytes and datatype, compute how many whole elements fit.
+// Returns at least 1 when dt is supported; returns 0 if dt is invalid.
 static size_t chunk_elems_from_bytes(size_t chunk_bytes, DATATYPE dt) {
   size_t es = elem_size(dt);
 
@@ -57,6 +62,8 @@ static size_t chunk_elems_from_bytes(size_t chunk_bytes, DATATYPE dt) {
   return elems ? elems : 1;
 }
 
+// For a total of 'count' elements split into chunks of 'chunk_elems', compute
+// the byte offset (*off) and byte length (*len) for the chunk with index 'idx'.
 static void chunk_offsets(size_t count, size_t chunk_elems, DATATYPE dt,
                           size_t idx, size_t *off, size_t *len) {
   size_t es = elem_size(dt);
@@ -73,6 +80,8 @@ static void chunk_offsets(size_t count, size_t chunk_elems, DATATYPE dt,
   *len = (end - start) * es;
 }
 
+// Compute which chunk index this rank should SEND in round 'round' (0..world-2)
+// in a ring-style reduce-scatter schedule.
 static int rs_send_chunk_index(int round, int rank, int world) {
   int r = round % world;
   int p = rank % world;
@@ -80,6 +89,8 @@ static int rs_send_chunk_index(int round, int rank, int world) {
   return (p - r + world) % world;
 }
 
+// Compute which chunk index this rank should RECEIVE in round 'round'
+// in a ring-style reduce-scatter schedule.
 static int rs_recv_chunk_index(int round, int rank, int world) {
   int r = round % world;
   int p = rank % world;
@@ -87,6 +98,8 @@ static int rs_recv_chunk_index(int round, int rank, int world) {
   return (p - r - 1 + world) % world;
 }
 
+// Apply the reduction operation 'op' elementwise from 'src' into 'dst' for 'n'
+// elements of type 'dt'. The result is stored in-place in 'dst'.
 static void reduce_inplace(void *dst, const void *src, size_t n, DATATYPE dt,
                            OPERATION op) {
   if (dt == DT_INT32) {
@@ -111,6 +124,8 @@ static void reduce_inplace(void *dst, const void *src, size_t n, DATATYPE dt,
   }
 }
 
+// Simulate a send/recv+reduce: reduce as many whole elements as fit in 'bytes'
+// from sendbuf into recvbuf using 'op' and copy any remaining tail bytes.
 static int pg_sendrecv_inline(struct pg *pg, void *sendbuf, void *recvbuf,
                               size_t bytes, DATATYPE dt, OPERATION op) {
   (void)pg;
@@ -124,15 +139,20 @@ static int pg_sendrecv_inline(struct pg *pg, void *sendbuf, void *recvbuf,
   return 0;
 }
 
+// Parse a whitespace-separated list of hostnames in 'list'. Determine total
+// number of entries (*n_out) and the index (*idx_out) matching 'me'. Returns 0
+// on success, -1 if 'me' is not found.
 static int parse_server_list(const char *list, const char *me, size_t *n_out,
                              size_t *idx_out) {
   size_t n = 0, idx = (size_t)-1;
   const char *p = list;
 
   while (*p) {
+    // Skip whitespace
     while (isspace((unsigned char)*p)) p++;
-
     if (!*p) break;
+
+    // Find end of current hostname
     const char *start = p;
     while (*p && !isspace((unsigned char)*p)) p++;
 
@@ -151,6 +171,9 @@ static int parse_server_list(const char *list, const char *me, size_t *n_out,
   return 0;
 }
 
+// Initialize a process group using a whitespace-separated 'serverlist'.
+// Determines this host's rank and world size, applies environment overrides,
+// and returns an opaque handle via 'out_handle'.
 int connect_process_group(const char *serverlist, void **out_handle) {
   if (!serverlist || !out_handle) return -1;
 
@@ -170,11 +193,14 @@ int connect_process_group(const char *serverlist, void **out_handle) {
   return 0;
 }
 
+// Destroy a process group handle returned by connect_process_group().
 int pg_close(void *pg_handle) {
   free(pg_handle);
   return 0;
 }
 
+// Reduce-Scatter: Reduce data across all ranks using 'op' and scatter the
+// reduced chunks so that each rank receives its own segment.
 int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
                       OPERATION op, void *pg_handle) {
   struct pg *pg = pg_handle;
@@ -210,6 +236,8 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
   return 0;
 }
 
+// All-Gather: Gather chunks from all ranks so that every rank ends up with the
+// concatenation of all ranks' data in 'recvbuf'.
 int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
                   void *pg_handle) {
   struct pg *pg = pg_handle;
@@ -245,6 +273,8 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
   return 0;
 }
 
+// All-Reduce: Compute reduction across all ranks so each rank gets the full
+// reduced result. Implemented as Reduce-Scatter followed by All-Gather.
 int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
                   OPERATION op, void *pg_handle) {
   struct pg *pg = pg_handle;

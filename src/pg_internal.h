@@ -1,42 +1,43 @@
 #ifndef PG_INTERNAL_H
 #define PG_INTERNAL_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "../include/pg.h"
+#include "constants.h"
 
-#define PG_DEFAULT_EAGER_MAX 4096
-#define PG_DEFAULT_CHUNK_BYTES 4096
-#define PG_DEFAULT_INFLIGHT 4
+/*
+ * This internal header defines functions and structures used exclusively by the
+ * process group (PG) implementation. It is not part of the public API and
+ * should not be included by applications using the PG library.
+ */
 
-struct qp_boot {
-  uint32_t qpn;
-  uint32_t psn;
-  uint8_t gid[16];
-  uint64_t addr;
-  uint32_t rkey;
-  uint32_t bytes;
-};
-
-struct pg {
-  int rank;
-  int world;
-  size_t chunk_bytes;
-  size_t eager_max;
-  int inflight;
-
-  char **hosts;
-  int port;
-  struct qp_boot left_qp;
-  struct qp_boot right_qp;
-  uint32_t max_inline_data;
-};
-
-// Initialize pg fields from environment variables (PG_EAGER_MAX,
-// PG_CHUNK_BYTES, PG_INFLIGHT) if they are zero-initialized; otherwise keep
-// existing values.
+/**
+ * @brief Initializes tuning parameters from environment variables.
+ *
+ * If the corresponding fields in the `struct pg` are zero-initialized, this
+ * function populates them with values from the following environment variables:
+ * - `PG_EAGER_MAX`: Eager protocol threshold.
+ * - `PG_CHUNK_BYTES`: Pipelining chunk size.
+ * - `PG_INFLIGHT`: Number of concurrent inflight chunks.
+ *
+ * If the environment variables are not set, it falls back to the default
+ * values defined in `constants.h`.
+ *
+ * @param pg The process group handle to initialize.
+ */
 void pg_init_env(struct pg *pg);
 
-// Establish ring TCP connectivity and exchange bootstrap info for QPs.
-int ring_connect(struct pg *pg);
+/**
+ * @brief Establishes TCP connections and exchanges bootstrap QP info.
+ *
+ * This function creates a ring of TCP connections among all ranks. Each rank
+ * connects to its right neighbor (`rank + 1`) and accepts a connection from its
+ * left neighbor (`rank - 1`). It then exchanges `qp_boot` structures over these
+ * connections to enable RDMA QP setup.
+ *
+ * @param pg The process group handle, which must have hosts, rank, and world
+ *           size initialized.
+ * @return 0 on success, -1 on failure.
+ */
+int pgnet_ring_connect(struct pg *pg);
 
 #endif /* PG_INTERNAL_H */

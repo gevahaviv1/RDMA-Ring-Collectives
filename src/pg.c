@@ -13,331 +13,344 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <infiniband/verbs.h>
+#include "constants.h"
 #include "pg_internal.h"
+#include "RDMA_api.h"
 
-// Initialize pg fields from environment variables (PG_EAGER_MAX,
-// PG_CHUNK_BYTES, PG_INFLIGHT) if they are zero-initialized; otherwise keep
-// existing values.
+/*
+ * This file implements the core logic for the process group, including
+ * initialization, resource management, and collective communication algorithms.
+ */
+
+//==============================================================================
+// Forward Declarations
+//==============================================================================
+
+static void pg_free_resources(struct pg *pg);
+
+//==============================================================================
+// Environment and Hostname Parsing
+//==============================================================================
+
+/**
+ * @brief Initializes pg fields from environment variables if they are not already set.
+ * This allows runtime tuning of performance-related parameters.
+ */
 void pg_init_env(struct pg *pg) {
-  const char *s;
-
-  if (!pg->eager_max) {
-    s = getenv("PG_EAGER_MAX");
-    pg->eager_max = s ? strtoul(s, NULL, 0) : PG_DEFAULT_EAGER_MAX;
-  }
-
-  if (!pg->chunk_bytes) {
-    s = getenv("PG_CHUNK_BYTES");
-    pg->chunk_bytes = s ? strtoul(s, NULL, 0) : PG_DEFAULT_CHUNK_BYTES;
-  }
-
-  if (!pg->inflight) {
-    s = getenv("PG_INFLIGHT");
-    pg->inflight = s ? atoi(s) : PG_DEFAULT_INFLIGHT;
-  }
-}
-
-// Return the size in bytes of one element of the given DATATYPE; 0 if
-// unsupported.
-static size_t elem_size(DATATYPE dt) {
-  switch (dt) {
-    case DT_INT32:
-      return sizeof(int32_t);
-    case DT_DOUBLE:
-      return sizeof(double);
-    default:
-      return 0;
-  }
-}
-
-// Given a chunk size in bytes and datatype, compute how many whole elements
-// fit. Returns at least 1 when dt is supported; returns 0 if dt is invalid.
-static size_t chunk_elems_from_bytes(size_t chunk_bytes, DATATYPE dt) {
-  size_t es = elem_size(dt);
-
-  if (!es) return 0;
-  size_t elems = chunk_bytes / es;
-
-  return elems ? elems : 1;
-}
-
-// For a total of 'count' elements split into chunks of 'chunk_elems', compute
-// the byte offset (*off) and byte length (*len) for the chunk with index 'idx'.
-static void chunk_offsets(size_t count, size_t chunk_elems, DATATYPE dt,
-                          size_t idx, size_t *off, size_t *len) {
-  size_t es = elem_size(dt);
-  size_t start = idx * chunk_elems;
-
-  if (start >= count) {
-    *off = *len = 0;
-    return;
-  }
-
-  size_t end = start + chunk_elems;
-  if (end > count) end = count;
-  *off = start * es;
-  *len = (end - start) * es;
-}
-
-// Compute which chunk index this rank should SEND in round 'round' (0..world-2)
-// in a ring-style reduce-scatter schedule.
-static int rs_send_chunk_index(int round, int rank, int world) {
-  int r = round % world;
-  int p = rank % world;
-  if (p < 0) p += world;
-  return (p - r + world) % world;
-}
-
-// Compute which chunk index this rank should RECEIVE in round 'round'
-// in a ring-style reduce-scatter schedule.
-static int rs_recv_chunk_index(int round, int rank, int world) {
-  int r = round % world;
-  int p = rank % world;
-  if (p < 0) p += world;
-  return (p - r - 1 + world) % world;
-}
-
-// Apply the reduction operation 'op' elementwise from 'src' into 'dst' for 'n'
-// elements of type 'dt'. The result is stored in-place in 'dst'.
-static void reduce_inplace(void *dst, const void *src, size_t n, DATATYPE dt,
-                           OPERATION op) {
-  if (dt == DT_INT32) {
-    int32_t *d = dst;
-    const int32_t *s = src;
-
-    if (op == OP_SUM) {
-      for (size_t i = 0; i < n; ++i) d[i] += s[i];
-    } else {
-      for (size_t i = 0; i < n; ++i) d[i] *= s[i];
+    const char *s;
+    if (!pg->eager_max && (s = getenv("PG_EAGER_MAX"))) {
+        pg->eager_max = strtoul(s, NULL, 0);
     }
-
-  } else if (dt == DT_DOUBLE) {
-    double *d = dst;
-    const double *s = src;
-
-    if (op == OP_SUM) {
-      for (size_t i = 0; i < n; ++i) d[i] += s[i];
-    } else {
-      for (size_t i = 0; i < n; ++i) d[i] *= s[i];
+    if (!pg->chunk_bytes && (s = getenv("PG_CHUNK_BYTES"))) {
+        pg->chunk_bytes = strtoul(s, NULL, 0);
     }
-  }
+    if (!pg->inflight && (s = getenv("PG_INFLIGHT"))) {
+        pg->inflight = atoi(s);
+    }
+    if (!pg->port && (s = getenv("PG_PORT"))) {
+        pg->port = atoi(s);
+    }
 }
 
-// Simulate a send/recv+reduce: reduce as many whole elements as fit in 'bytes'
-// from sendbuf into recvbuf using 'op' and copy any remaining tail bytes.
-static int pg_sendrecv_inline(struct pg *pg, void *sendbuf, void *recvbuf,
-                              size_t bytes, DATATYPE dt, OPERATION op) {
-  (void)pg;
-  size_t es = elem_size(dt);
-  size_t n = es ? bytes / es : 0;
-
-  if (n) reduce_inplace(recvbuf, sendbuf, n, dt, op);
-  size_t rem = es ? bytes % es : bytes;
-
-  if (rem) memcpy((char *)recvbuf + n * es, (char *)sendbuf + n * es, rem);
-  return 0;
-}
-
-// Parse a whitespace-separated list of hostnames in 'list'. Determine total
-// number of entries (*n_out) and the index (*idx_out) matching 'me'. Returns 0
-// on success, -1 if 'me' is not found.
+/**
+ * @brief Parses a whitespace-separated list of hostnames.
+ * @return 0 on success, -1 on failure (e.g., 'me' not in list, or OOM).
+ */
 static int parse_server_list(const char *list, const char *me, size_t *n_out,
                              size_t *idx_out, char ***hosts_out) {
-  size_t n = 0, idx = (size_t)-1;
-  const char *p = list;
+    size_t n = 0, capacity = 8;
+    char **hosts = malloc(capacity * sizeof(char *));
+    if (!hosts) return -1;
 
-  // first pass: count hosts and find our index
-  while (*p) {
-    while (isspace((unsigned char)*p)) p++;
-    if (!*p) break;
+    const char *p = list;
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p)) p++;
 
-    const char *start = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-
-    size_t len = (size_t)(p - start);
-    size_t me_len = strlen(me);
-    if (idx == (size_t)-1 &&
-        ((me_len >= len && strncmp(me, start, len) == 0) ||
-         (len >= me_len && strncmp(start, me, me_len) == 0)))
-      idx = n;
-    n++;
-  }
-
-  if (idx == (size_t)-1) return -1;
-
-  char **hosts = calloc(n, sizeof(char *));
-  if (!hosts) return -1;
-
-  // second pass: copy hostnames
-  p = list;
-  size_t i = 0;
-  while (*p && i < n) {
-    while (isspace((unsigned char)*p)) p++;
-    if (!*p) break;
-
-    const char *start = p;
-    while (*p && !isspace((unsigned char)*p)) p++;
-    size_t len = (size_t)(p - start);
-    hosts[i] = strndup(start, len);
-    if (!hosts[i]) {
-      for (size_t j = 0; j < i; ++j) free(hosts[j]);
-      free(hosts);
-      return -1;
+        if (n == capacity) {
+            capacity *= 2;
+            char **new_hosts = realloc(hosts, capacity * sizeof(char *));
+            if (!new_hosts) goto fail_alloc;
+            hosts = new_hosts;
+        }
+        hosts[n] = strndup(start, p - start);
+        if (!hosts[n]) goto fail_alloc;
+        n++;
     }
-    i++;
-  }
 
-  *n_out = n;
-  *idx_out = idx;
-  *hosts_out = hosts;
-  return 0;
-}
+    for (size_t i = 0; i < n; ++i) {
+        if (strcmp(hosts[i], me) == 0) {
+            *idx_out = i;
+            *n_out = n;
+            *hosts_out = hosts;
+            return 0;
+        }
+    }
 
-// (networking helpers moved to src/pg_net.c)
-
-// Initialize a process group using a whitespace-separated 'serverlist'.
-// Determines this host's rank and world size, applies environment overrides,
-// and returns an opaque handle via 'out_handle'. Establishes a TCP ring when
-// world > 1.
-int connect_process_group(const char *serverlist, void **out_handle) {
-  if (!serverlist || !out_handle) return -1;
-
-  char host[256];
-  if (gethostname(host, sizeof(host)) != 0) return -1;
-
-  size_t n = 0, idx = 0;
-  char **hosts = NULL;
-  if (parse_server_list(serverlist, host, &n, &idx, &hosts) != 0) return -1;
-
-  struct pg *pg = calloc(1, sizeof(*pg));
-  if (!pg) {
+    fprintf(stderr, "Hostname '%s' not found in server list\n", me);
+fail_alloc:
     for (size_t i = 0; i < n; ++i) free(hosts[i]);
     free(hosts);
     return -1;
-  }
+}
 
-  pg->rank = (int)idx;
-  pg->world = (int)n;
-  pg->hosts = hosts;
-  pg_init_env(pg);
+//==============================================================================
+// Collective Algorithm Helpers
+//==============================================================================
 
-  const char *ps = getenv("PG_PORT");
-  pg->port = ps ? atoi(ps) : 18515;
+/** @brief Returns the size in bytes of a single element of a given DATATYPE. */
+static size_t elem_size(DATATYPE dt) {
+    switch (dt) {
+        case DT_INT32: return sizeof(int32_t);
+        case DT_DOUBLE: return sizeof(double);
+        default: return 0;
+    }
+}
 
-  if (pg->world > 1) {
-    if (ring_connect(pg) != 0) goto fail;
-  }
+/** @brief Computes how many whole elements of a datatype fit in a chunk. */
+static size_t chunk_elems_from_bytes(size_t chunk_bytes, DATATYPE dt) {
+    size_t es = elem_size(dt);
+    if (!es) return 0;
+    size_t elems = chunk_bytes / es;
+    return elems > 0 ? elems : 1;
+}
 
-  *out_handle = pg;
-  return 0;
+/** @brief Computes the byte offset and length for a chunk index. */
+static void chunk_offsets(size_t count, size_t chunk_elems, DATATYPE dt,
+                          size_t idx, size_t *off, size_t *len) {
+    size_t es = elem_size(dt);
+    size_t start = idx * chunk_elems;
+    if (start >= count) {
+        *off = *len = 0;
+        return;
+    }
+    size_t end = start + chunk_elems;
+    if (end > count) end = count;
+    *off = start * es;
+    *len = (end - start) * es;
+}
+
+/** @brief Computes the send chunk index for a rank in a ring reduce-scatter. */
+static int rs_send_chunk_index(int round, int rank, int world) {
+    return (rank - round + world) % world;
+}
+
+/** @brief Computes the receive chunk index for a rank in a ring reduce-scatter. */
+static int rs_recv_chunk_index(int round, int rank, int world) {
+    return (rank - round - 1 + world) % world;
+}
+
+/** @brief Applies a reduction operation element-wise from 'src' to 'dst'. */
+static void reduce_inplace(void *dst, const void *src, size_t n, DATATYPE dt, OPERATION op) {
+    if (dt == DT_INT32) {
+        int32_t *d = dst; const int32_t *s = src;
+        for (size_t i = 0; i < n; ++i) d[i] = (op == OP_SUM) ? (d[i] + s[i]) : (d[i] * s[i]);
+    } else if (dt == DT_DOUBLE) {
+        double *d = dst; const double *s = src;
+        for (size_t i = 0; i < n; ++i) d[i] = (op == OP_SUM) ? (d[i] + s[i]) : (d[i] * s[i]);
+    }
+}
+
+/**
+ * @brief MOCK IMPLEMENTATION of a send-receive operation.
+ * In a real implementation, this would post RDMA sends/receives.
+ * Here, it just simulates the data transfer and reduction locally.
+ */
+static int pg_sendrecv_mock(struct pg *pg, void *sendbuf, void *recvbuf,
+                              size_t bytes, DATATYPE dt, OPERATION op) {
+    (void)pg; // Unused in mock
+    size_t es = elem_size(dt);
+    size_t n = es ? bytes / es : 0;
+    if (n > 0) {
+        reduce_inplace(recvbuf, sendbuf, n, dt, op);
+    }
+    size_t rem = es ? bytes % es : 0;
+    if (rem > 0) {
+        memcpy((char *)recvbuf + n * es, (char *)sendbuf + n * es, rem);
+    }
+    return 0;
+}
+
+//==============================================================================
+// Public API Implementation
+//==============================================================================
+
+int connect_process_group(const char *serverlist, void **out_handle) {
+    if (!serverlist || !out_handle) return -1;
+
+    char self_host[256];
+    if (gethostname(self_host, sizeof(self_host)) != 0) {
+        fprintf(stderr, "gethostname failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct pg *pg = calloc(1, sizeof(*pg));
+    if (!pg) return -1;
+
+    if (parse_server_list(serverlist, self_host, (size_t *)&pg->world, (size_t *)&pg->rank, &pg->hosts) != 0) {
+        free(pg);
+        return -1;
+    }
+
+    // Set defaults and apply environment overrides
+    pg->eager_max = PG_DEFAULT_EAGER_MAX;
+    pg->chunk_bytes = PG_DEFAULT_CHUNK_BYTES;
+    pg->inflight = PG_DEFAULT_INFLIGHT;
+    pg->port = PG_DEFAULT_PORT;
+    pg->ib_port = PG_DEFAULT_IB_PORT;
+    pg_init_env(pg);
+
+    // Initialize RDMA resources
+    if (!(pg->ctx = rdma_open_device())) goto fail;
+    if (!(pg->pd = rdma_alloc_pd(pg->ctx))) goto fail;
+    if (!(pg->cq = rdma_create_cq(pg->ctx, pg->inflight * 2))) goto fail;
+
+    // Allocate and register a communication buffer
+    size_t bufsize = pg->chunk_bytes * (size_t)(pg->inflight * 2);
+    if (bufsize < MIN_BUFFER_SIZE) bufsize = MIN_BUFFER_SIZE;
+    pg->buf = aligned_alloc(PAGE_SIZE, bufsize);
+    if (!pg->buf) goto fail;
+    pg->mr = rdma_reg_mr(pg->pd, pg->buf, bufsize);
+    if (!pg->mr) goto fail;
+
+    // Create QPs for ring communication
+    uint32_t inline_hint = (pg->eager_max < MAX_INLINE_SIZE) ? (uint32_t)pg->eager_max : MAX_INLINE_SIZE;
+    pg->qp_left  = rdma_create_qp(pg->pd, pg->cq, inline_hint);
+    pg->qp_right = rdma_create_qp(pg->pd, pg->cq, inline_hint);
+    if (!pg->qp_left || !pg->qp_right) goto fail;
+
+    // Transition QPs to INIT state
+    if (rdma_qp_to_init(pg->qp_left, pg->ib_port, 1) != 0) goto fail;
+    if (rdma_qp_to_init(pg->qp_right, pg->ib_port, 1) != 0) goto fail;
+
+    // Establish network connections and exchange bootstrap info
+    if (pg->world > 1) {
+        if (pgnet_ring_connect(pg) != 0) goto fail;
+    }
+
+    *out_handle = pg;
+    return 0;
 
 fail:
-  if (hosts) {
-    for (size_t i = 0; i < n; ++i) free(hosts[i]);
-    free(hosts);
-  }
-  free(pg);
-  return -1;
+    fprintf(stderr, "Process group connection failed during setup.\n");
+    pg_free_resources(pg);
+    return -1;
 }
 
-// Destroy a process group handle returned by connect_process_group().
 int pg_close(void *pg_handle) {
-  struct pg *pg = pg_handle;
-  if (!pg) return 0;
-
-  if (pg->hosts) {
-    for (int i = 0; i < pg->world; ++i) free(pg->hosts[i]);
-    free(pg->hosts);
-  }
-
-  free(pg);
-  return 0;
+    if (!pg_handle) return 0;
+    pg_free_resources((struct pg *)pg_handle);
+    return 0;
 }
 
-// Reduce-Scatter: Reduce data across all ranks using 'op' and scatter the
-// reduced chunks so that each rank receives its own segment.
 int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
                       OPERATION op, void *pg_handle) {
-  struct pg *pg = pg_handle;
-  if (!pg || !sendbuf || !recvbuf || count < 0) return -1;
+    struct pg *pg = pg_handle;
+    if (!pg || !sendbuf || !recvbuf || count < 0 || elem_size(dt) == 0) return -1;
 
-  pg_init_env(pg);
-  if (pg->world == 1) {
-    size_t es = elem_size(dt);
-    memcpy(recvbuf, sendbuf, (size_t)count * es);
+    if (pg->world == 1) {
+        memcpy(recvbuf, sendbuf, (size_t)count * elem_size(dt));
+        return 0;
+    }
+
+    size_t chunk_elems = chunk_elems_from_bytes(pg->chunk_bytes, dt);
+
+    // In a real implementation, this loop would be pipelined with RDMA operations.
+    for (int r = 0; r < pg->world - 1; ++r) {
+        int send_idx = rs_send_chunk_index(r, pg->rank, pg->world);
+        int recv_idx = rs_recv_chunk_index(r, pg->rank, pg->world);
+
+        size_t send_off, send_len, recv_off, recv_len;
+        chunk_offsets((size_t)count, chunk_elems, dt, (size_t)send_idx, &send_off, &send_len);
+        chunk_offsets((size_t)count, chunk_elems, dt, (size_t)recv_idx, &recv_off, &recv_len);
+
+        if (recv_len > 0) {
+            // MOCK: This should be an RDMA send to the right neighbor and recv from the left.
+            pg_sendrecv_mock(pg, (char *)sendbuf + send_off, (char *)recvbuf + recv_off, recv_len, dt, op);
+        }
+    }
     return 0;
-  }
-
-  size_t chunk_elems = chunk_elems_from_bytes(pg->chunk_bytes, dt);
-  if (!chunk_elems) return -1;
-
-  for (int r = 0; r < pg->world - 1; ++r) {
-    int send_idx = rs_send_chunk_index(r, pg->rank, pg->world);
-    int recv_idx = rs_recv_chunk_index(r, pg->rank, pg->world);
-
-    size_t send_off = 0, send_len = 0;
-    size_t recv_off = 0, recv_len = 0;
-
-    chunk_offsets((size_t)count, chunk_elems, dt, (size_t)send_idx, &send_off,
-                  &send_len);
-    chunk_offsets((size_t)count, chunk_elems, dt, (size_t)recv_idx, &recv_off,
-                  &recv_len);
-
-    if (!recv_len) continue;
-    pg_sendrecv_inline(pg, (char *)sendbuf + send_off,
-                       (char *)recvbuf + recv_off, recv_len, dt, op);
-  }
-
-  return 0;
 }
 
-// All-Gather: Gather chunks from all ranks so that every rank ends up with the
-// concatenation of all ranks' data in 'recvbuf'.
-int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
-                  void *pg_handle) {
-  struct pg *pg = pg_handle;
-  if (!pg || !recvbuf || count < 0) return -1;
+int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt, void *pg_handle) {
+    struct pg *pg = pg_handle;
+    if (!pg || !recvbuf || count < 0 || elem_size(dt) == 0) return -1;
 
-  pg_init_env(pg);
-  if (sendbuf && sendbuf != recvbuf) {
     size_t es = elem_size(dt);
-    memcpy(recvbuf, sendbuf, (size_t)count * es);
-  }
+    size_t total_bytes = (size_t)count * (size_t)pg->world * es;
+    size_t rank_bytes = (size_t)count * es;
 
-  if (pg->world == 1) return 0;
+    // Copy local data into the correct slot in the final buffer.
+    if (sendbuf) {
+        memcpy((char *)recvbuf + (size_t)pg->rank * rank_bytes, sendbuf, rank_bytes);
+    }
 
-  size_t chunk_elems = chunk_elems_from_bytes(pg->chunk_bytes, dt);
-  if (!chunk_elems) return -1;
+    if (pg->world == 1) return 0;
 
-  for (int r = 0; r < pg->world - 1; ++r) {
-    int send_idx = (pg->rank + 1 - r + pg->world) % pg->world;
-    int recv_idx = (pg->rank - r + pg->world) % pg->world;
+    // In a real implementation, this would use RDMA to exchange data.
+    for (int r = 0; r < pg->world - 1; ++r) {
+        int send_rank_idx = (pg->rank - r + pg->world) % pg->world;
+        int recv_rank_idx = (pg->rank - r - 1 + pg->world) % pg->world;
 
-    size_t send_off = 0, send_len = 0;
-    size_t recv_off = 0, recv_len = 0;
+        void *sbuf = (char *)recvbuf + (size_t)send_rank_idx * rank_bytes;
+        void *rbuf = (char *)recvbuf + (size_t)recv_rank_idx * rank_bytes;
 
-    chunk_offsets((size_t)count, chunk_elems, dt, (size_t)send_idx, &send_off,
-                  &send_len);
-    chunk_offsets((size_t)count, chunk_elems, dt, (size_t)recv_idx, &recv_off,
-                  &recv_len);
+        // MOCK: This should be an RDMA send/recv pair.
+        pg_sendrecv_mock(pg, sbuf, rbuf, rank_bytes, dt, OP_SUM); // op is ignored for memcpy
+    }
 
-    if (!recv_len) continue;
-    memcpy((char *)recvbuf + recv_off, (char *)recvbuf + send_off, recv_len);
-  }
-
-  return 0;
+    return 0;
 }
 
-// All-Reduce: Compute reduction across all ranks so each rank gets the full
-// reduced result. Implemented as Reduce-Scatter followed by All-Gather.
-int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
-                  OPERATION op, void *pg_handle) {
-  struct pg *pg = pg_handle;
-  if (!pg || !sendbuf || !recvbuf || count < 0) return -1;
+int pg_all_reduce(void *sendbuf, void *recvbuf, int count, DATATYPE dt, OPERATION op, void *pg_handle) {
+    struct pg *pg = pg_handle;
+    if (!pg || !sendbuf || !recvbuf || count < 0) return -1;
 
-  size_t es = elem_size(dt);
-  if (sendbuf != recvbuf) memcpy(recvbuf, sendbuf, (size_t)count * es);
-  if (pg_reduce_scatter(recvbuf, recvbuf, count, dt, op, pg) != 0) return -1;
+    // For out-of-place, copy send buffer to receive buffer to start.
+    if (sendbuf != recvbuf) {
+        memcpy(recvbuf, sendbuf, (size_t)count * elem_size(dt));
+    }
 
-  return pg_all_gather(recvbuf, recvbuf, count, dt, pg);
+    // Step 1: Reduce-Scatter. Each rank gets a reduced chunk of the result.
+    if (pg_reduce_scatter(recvbuf, recvbuf, count, dt, op, pg) != 0) {
+        return -1;
+    }
+
+    // Step 2: All-Gather. Exchange the reduced chunks so all ranks have the full result.
+    return pg_all_gather(recvbuf, recvbuf, count, dt, pg);
+}
+
+//==============================================================================
+// Internal Resource Management
+//==============================================================================
+
+/**
+ * @brief Frees all resources associated with a process group.
+ * This is the central cleanup function, ensuring resources are released in the correct order.
+ */
+static void pg_free_resources(struct pg *pg) {
+    if (!pg) return;
+
+    // Destroy QPs first, as they depend on other resources.
+    if (pg->qp_left)  ibv_destroy_qp(pg->qp_left);
+    if (pg->qp_right) ibv_destroy_qp(pg->qp_right);
+    if (pg->cq)       ibv_destroy_cq(pg->cq);
+    if (pg->mr)       ibv_dereg_mr(pg->mr);
+    if (pg->pd)       ibv_dealloc_pd(pg->pd);
+    if (pg->ctx)      ibv_close_device(pg->ctx);
+
+    // Free memory allocations.
+    if (pg->buf)      free(pg->buf);
+    if (pg->hosts) {
+        for (int i = 0; i < pg->world; ++i) {
+            free(pg->hosts[i]);
+        }
+        free(pg->hosts);
+    }
+
+    // Finally, free the pg struct itself.
+    free(pg);
 }

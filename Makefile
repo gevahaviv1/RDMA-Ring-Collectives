@@ -1,20 +1,17 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -g
-LIBS = -libverbs -lpthread
-INCLUDES = -Iinclude
+CFLAGS = -Wall -O2 -g -Iinclude -Isrc
+LDFLAGS = -lpthread -libverbs
 
-SRCS = src/pg.c src/pg_net.c src/RDMA_api.c
-OBJS = $(SRCS:.c=.o)
+SRC = src/pg.c src/pg_net.c src/RDMA_api.c src/test_connect.c
+OBJ = $(SRC:.c=.o)
 
-all: libpg.a
+TARGET = test_connect
 
-%.o: %.c
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+all: $(TARGET)
 
-libpg.a: $(OBJS)
-	ar rcs $@ $^
+$(TARGET): $(OBJ)
+	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 
 clean:
-	rm -f $(OBJS) libpg.a
+	rm -f $(OBJ) $(TARGET)
 
-.PHONY: all clean

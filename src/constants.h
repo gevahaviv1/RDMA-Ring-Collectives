@@ -72,4 +72,21 @@
  */
 #define PG_DEFAULT_INFLIGHT 4
 
+/* --- Compatibility aliases for code that expects these names --- */
+#ifndef MIN_BUFFER_SIZE
+/* Minimum staging window for bootstrap buffers (bytes). */
+#define MIN_BUFFER_SIZE  (PG_DEFAULT_CHUNK_BYTES)      /* 4 KiB default */
+#endif
+
+#ifndef MAX_INLINE_SIZE
+/* Upper bound when picking SEND inline size. */
+#define MAX_INLINE_SIZE  (PG_DEFAULT_INLINE_HINT)      /* 256 by default */
+#endif
+
+/* Alignment used for aligned_alloc of the staging buffer.
+   If your code wants PAGE_SIZE as a macro, provide a safe default. */
+#ifndef PAGE_SIZE
+#define PAGE_SIZE 4096
+#endif
+
 #endif // CONSTANTS_H

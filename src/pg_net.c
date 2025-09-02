@@ -393,37 +393,53 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     // Direction-specific fields
     my_left.qpn  = pg->qp_left->qp_num;
     my_right.qpn = pg->qp_right->qp_num;
-    my_left.psn  = lrand48() & 0xFFFFFF;
-    my_right.psn = lrand48() & 0xFFFFFF;
+
+    // Generate high-quality, non-zero PSNs using getrandom()
+    uint32_t psns[2] = {0};
+    if (getrandom(psns, sizeof(psns), 0) != sizeof(psns)) {
+        // Fallback for environments without getrandom (less ideal)
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        long seed = (long)ts.tv_nsec ^ (long)ts.tv_sec ^ (long)getpid() ^ (long)pg->rank;
+        srand48(seed);
+        psns[0] = (uint32_t)lrand48();
+        psns[1] = (uint32_t)lrand48();
+    }
+    my_left.psn  = (psns[0] & 0xFFFFFF) ?: 1; // ensure not 0
+    my_right.psn = (psns[1] & 0xFFFFFF) ?: 1; // ensure not 0
 
     // 3. Exchange bootstrap info with neighbors.
     // Classic ring-safe ordering:
     //   - rank 0: send-first to right, then recv-first from left
     //   - others: recv-first from left, then send-first to right
     if (pg->rank == 0) {
-        fprintf(stderr, "[boot] (rank0) exch with right (send-first): send qp_right=%u, then recv peer_left\n", my_right.qpn);
+        fprintf(stderr, "[boot] (rank0) exch with right (send-first): send qp_right=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
         }
-        fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send qp_left=%u\n", my_left.qpn);
+        fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send qp_left=%u psn=%u\n", my_left.qpn, my_left.psn);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
     } else {
-        fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send qp_left=%u\n", my_left.qpn);
+        fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send qp_left=%u psn=%u\n", my_left.qpn, my_left.psn);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
-        fprintf(stderr, "[boot] exch with right (send-first): send qp_right=%u, then recv peer_left\n", my_right.qpn);
+        fprintf(stderr, "[boot] exch with right (send-first): send qp_right=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
         }
     }
 
+    // 4. Dump received remote info for diagnostics, then transition to RTR/RTS.
+    fprintf(stderr, "[boot] rx left:  qpn=%u psn=%u rkey=%u bytes=%u gid0=%02x\n",
+            pg->left_qp.qpn, pg->left_qp.psn, pg->left_qp.rkey, pg->left_qp.bytes, pg->left_qp.gid[0]);
+    fprintf(stderr, "[boot] rx right: qpn=%u psn=%u rkey=%u bytes=%u gid0=%02x\n",
+            pg->right_qp.qpn, pg->right_qp.psn, pg->right_qp.rkey, pg->right_qp.bytes, pg->right_qp.gid[0]);
     // 4. Transition local QPs to RTR and RTS using received remote info.
     enum ibv_mtu mtu = IBV_MTU_1024;
     if (rdma_qp_to_rtr(pg->qp_left, &pg->left_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;

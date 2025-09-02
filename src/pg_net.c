@@ -436,6 +436,26 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         pg->max_inline_data = 0; // Fallback if query fails
     }
 
+    // 6. Post-RTS ready handshake on TCP to prevent early RDMA sends before peers are ready.
+    //    This keeps public API unchanged while adding robustness.
+    uint8_t tok = 0xA5, peer = 0;
+    ssize_t n;
+    if (pg->rank == 0) {
+        // rank0: notify right first, then wait for left
+        n = send(right_fd, &tok, 1, 0);
+        if (n != 1) { perror("send ready->right"); return -1; }
+        n = recv(left_fd, &peer, 1, MSG_WAITALL);
+        if (n != 1) { perror("recv ready<-left"); return -1; }
+        fprintf(stderr, "[boot] (rank0) ready handshake OK (right then left)\n");
+    } else {
+        // others: wait from left first, then notify right
+        n = recv(left_fd, &peer, 1, MSG_WAITALL);
+        if (n != 1) { perror("recv ready<-left"); return -1; }
+        n = send(right_fd, &tok, 1, 0);
+        if (n != 1) { perror("send ready->right"); return -1; }
+        fprintf(stderr, "[boot] ready handshake OK (left then right)\n");
+    }
+
     return 0;
 }
 

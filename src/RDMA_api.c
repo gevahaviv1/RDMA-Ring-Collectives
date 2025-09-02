@@ -143,7 +143,7 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
     attr.ah_attr.is_global = 1;
     memcpy(&attr.ah_attr.grh.dgid, remote->gid, 16);
     attr.ah_attr.grh.sgid_index = sgid_index;
-    attr.ah_attr.grh.hop_limit = 1; // Assuming single-switch network
+    attr.ah_attr.grh.hop_limit = 64; // Allow routing across multiple L3 hops
     attr.ah_attr.dlid = 0;          // Not used with RoCE/GRH
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
@@ -151,6 +151,10 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
 
     int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    // Debug hint about remote addressing
+    fprintf(stderr, "[rdma] to RTR: remote qpn=%u rq_psn=%u mtu=%d gid[0]=%02x\n",
+            remote->qpn, remote->psn, (int)mtu, remote->gid[0]);
+
     if (ibv_modify_qp(qp, &attr, mask)) {
         fprintf(stderr, "Failed to transition QP to RTR state\n");
         return -1;

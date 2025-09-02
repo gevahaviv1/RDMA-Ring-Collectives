@@ -11,33 +11,43 @@
 
 // Simple TCP-based ring barrier for test synchronization
 static int tcp_barrier(struct pg *pg) {
-    char dummy_val = 'a';
-    int rank = pg->rank;
-    int world_size = pg->world_size;
-    int left_fd = pg->left_fd;
-    int right_fd = pg->right_fd;
+    if (pg->world_size <= 1) {
+        return 0;
+    }
 
-    for (int i = 0; i < world_size; i++) {
-        if (rank == i) {
-            if (send(right_fd, &dummy_val, sizeof(dummy_val), 0) != sizeof(dummy_val)) {
-                perror("barrier send");
-                return -1;
-            }
-            if (recv(left_fd, &dummy_val, sizeof(dummy_val), MSG_WAITALL) != sizeof(dummy_val)) {
-                perror("barrier recv");
-                return -1;
-            }
-        } else {
-            if (recv(left_fd, &dummy_val, sizeof(dummy_val), MSG_WAITALL) != sizeof(dummy_val)) {
-                perror("barrier recv");
-                return -1;
-            }
-            if (send(right_fd, &dummy_val, sizeof(dummy_val), 0) != sizeof(dummy_val)) {
-                perror("barrier send");
-                return -1;
-            }
+    // Simple ring barrier using the bootstrap TCP sockets
+    char token = 'S'; // Sync token
+    int rank = pg->rank;
+
+    fprintf(stderr, "Rank %d entering TCP barrier.\n", rank);
+
+    if (rank == 0) {
+        fprintf(stderr, "Rank 0 sending token to right...\n");
+        if (write(pg->right_fd, &token, sizeof(token)) != sizeof(token)) {
+            perror("tcp_barrier: rank 0 write to right failed");
+            return -1;
+        }
+        fprintf(stderr, "Rank 0 waiting for token from left...\n");
+        if (read(pg->left_fd, &token, sizeof(token)) != sizeof(token)) {
+            perror("tcp_barrier: rank 0 read from left failed");
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "Rank %d waiting for token from left...\n", rank);
+        if (read(pg->left_fd, &token, sizeof(token)) != sizeof(token)) {
+            fprintf(stderr, "tcp_barrier: rank %d read from left failed\n", rank);
+            perror("read");
+            return -1;
+        }
+        fprintf(stderr, "Rank %d received token, sending to right...\n", rank);
+        if (write(pg->right_fd, &token, sizeof(token)) != sizeof(token)) {
+            fprintf(stderr, "tcp_barrier: rank %d write to right failed\n", rank);
+            perror("write");
+            return -1;
         }
     }
+
+    fprintf(stderr, "Rank %d passed TCP barrier.\n", rank);
     return 0;
 }
 
@@ -47,7 +57,12 @@ static int post_one_recv(struct ibv_qp *qp, struct ibv_mr *mr, int *buf) {
       .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
   struct ibv_recv_wr wr = {.wr_id = 1, .sg_list = &sge, .num_sge = 1};
   struct ibv_recv_wr *bad;
-  return ibv_post_recv(qp, &wr, &bad);
+  fprintf(stderr, "Posting receive buffer...\n");
+  int ret = ibv_post_recv(qp, &wr, &bad);
+  if (ret) {
+    fprintf(stderr, "Failed to post RECV\n");
+  }
+  return ret;
 }
 
 static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
@@ -60,7 +75,12 @@ static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
                            .opcode = IBV_WR_SEND,
                            .send_flags = send_flags};
   struct ibv_send_wr *bad;
-  return ibv_post_send(qp, &wr, &bad);
+  fprintf(stderr, "Posting send buffer...\n");
+  int ret = ibv_post_send(qp, &wr, &bad);
+  if (ret) {
+    fprintf(stderr, "Failed to post SEND\n");
+  }
+  return ret;
 }
 
 int main(int argc, char *argv[]) {
@@ -121,6 +141,7 @@ int main(int argc, char *argv[]) {
   }
 
   // Post RECV from left neighbor
+  fprintf(stderr, "Rank %d posting receive buffer...\n", myindex);
   if (post_one_recv(handle->qp_left, recv_mr, &recv_val)) {
     fprintf(stderr, "Failed to post RECV\n");
     return EXIT_FAILURE;
@@ -135,6 +156,7 @@ int main(int argc, char *argv[]) {
   // Post SEND to right neighbor
   uint32_t flags = IBV_SEND_SIGNALED;
   if (handle->max_inline_data >= sizeof(int)) flags |= IBV_SEND_INLINE;
+  fprintf(stderr, "Rank %d posting send to right...\n", myindex);
   if (post_one_send(handle->qp_right, send_mr, &send_val, flags)) {
     fprintf(stderr, "Failed to post SEND\n");
     return EXIT_FAILURE;

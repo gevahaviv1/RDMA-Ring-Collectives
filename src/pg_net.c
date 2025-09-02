@@ -10,6 +10,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include "pg_internal.h"
 #include "RDMA_api.h"
@@ -97,50 +99,58 @@ static int getenv_int(const char *name, int fallback) {
  * @return 0 on success, -1 on failure.
  */
 static int pgnet_setup_listen_socket(int port, int *listen_fd_out) {
-    struct addrinfo hints, *ai = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
-
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%d", port);
-
-    if (getaddrinfo(NULL, portstr, &hints, &ai) != 0) {
-        fprintf(stderr, "getaddrinfo failed for port %s\n", portstr);
+    // Create IPv4 non-blocking listen socket, bind to INADDR_ANY
+    int fd_listen = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd_listen < 0) {
+        perror("[net] socket");
         return -1;
     }
 
-    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd < 0) {
-        fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-        freeaddrinfo(ai);
-        return -1;
-    }
-
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    int reuse = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int one = 1;
+    setsockopt(fd_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #ifdef SO_REUSEPORT
-    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+    setsockopt(fd_listen, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 #endif
 
-    if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
-        fprintf(stderr, "bind() to port %s failed: %s\n", portstr, strerror(errno));
-        freeaddrinfo(ai);
-        close(fd);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY); // not 127.0.0.1
+    sa.sin_port = htons((uint16_t)port);
+
+    if (bind(fd_listen, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("[net] bind");
+        close(fd_listen);
+        return -1;
+    }
+    if (listen(fd_listen, 128) < 0) { // backlog
+        perror("[net] listen");
+        close(fd_listen);
         return -1;
     }
 
-    if (listen(fd, 128) != 0) { // Increased backlog
-        fprintf(stderr, "listen() failed: %s\n", strerror(errno));
-        freeaddrinfo(ai);
-        close(fd);
-        return -1;
+    // Debug: report actual bound address/port
+    {
+        struct sockaddr_storage got; socklen_t glen = sizeof(got);
+        if (getsockname(fd_listen, (struct sockaddr*)&got, &glen) == 0) {
+            char ip[INET6_ADDRSTRLEN] = {0};
+            uint16_t p = 0;
+            if (got.ss_family == AF_INET) {
+                struct sockaddr_in *a = (struct sockaddr_in*)&got;
+                inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip);
+                p = ntohs(a->sin_port);
+            } else if (got.ss_family == AF_INET6) {
+                struct sockaddr_in6 *a6 = (struct sockaddr_in6*)&got;
+                inet_ntop(AF_INET6, &a6->sin6_addr, ip, sizeof ip);
+                p = ntohs(a6->sin6_port);
+            }
+            fprintf(stderr, "[net] actually listening on %s:%u\n", ip, p);
+        } else {
+            perror("[net] getsockname");
+        }
     }
 
-    freeaddrinfo(ai);
-    *listen_fd_out = fd;
+    *listen_fd_out = fd_listen;
     return 0;
 }
 
@@ -188,7 +198,7 @@ static int pgnet_connect_nonblocking(const char *host, int port, int *conn_fd_ou
  * @return 0 on success, -1 on timeout or error.
  */
 static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int right_port,
-                                  int timeout_ms, int backoff_ms,
+                                  int timeout_ms, int backoff_ms, int rank,
                                   int *left_fd_out, int *right_fd_out) {
     int64_t start = now_ms();
     int64_t deadline = start + timeout_ms;
@@ -250,7 +260,7 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 // Keep sockets non-blocking to ensure robust I/O; our read/write handle EAGAIN
                 left_fd = fd;
 #ifdef PG_DEBUG
-                fprintf(stderr, "[net] accept left OK\n");
+                fprintf(stderr, "[net] rank=%d accept left OK\n", rank);
 #endif
             } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 fprintf(stderr, "accept() failed: %s\n", strerror(errno));
@@ -268,7 +278,7 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 conn_fd = -1;
                 pfds[1].fd = -1;
 #ifdef PG_DEBUG
-                fprintf(stderr, "[net] connect right OK\n");
+                fprintf(stderr, "[net] rank=%d connect right OK\n", rank);
 #endif
             } else {
                 // transient failure: retry until deadline
@@ -397,7 +407,7 @@ int pgnet_ring_connect(struct pg *pg) {
 
     // Single loop handles both accept and connect with retry/backoff until timeout
     if (pgnet_poll_until_ready(listen_fd, pg->hosts[right], right_port,
-                               timeout_ms, backoff_ms, &left_fd, &right_fd) != 0) {
+                               timeout_ms, backoff_ms, pg->rank, &left_fd, &right_fd) != 0) {
         goto fail;
     }
 

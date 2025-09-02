@@ -53,34 +53,34 @@ static int tcp_barrier(struct pg *pg) {
 
 // Simple helper: post one RECV
 static int post_one_recv(struct ibv_qp *qp, struct ibv_mr *mr, int *buf) {
-  struct ibv_sge sge = {
-      .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
-  struct ibv_recv_wr wr = {.wr_id = 1, .sg_list = &sge, .num_sge = 1};
-  struct ibv_recv_wr *bad;
-  fprintf(stderr, "Posting receive buffer...\n");
-  int ret = ibv_post_recv(qp, &wr, &bad);
-  if (ret) {
-    fprintf(stderr, "Failed to post RECV\n");
-  }
-  return ret;
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
+    struct ibv_recv_wr wr = {.wr_id = 1, .sg_list = &sge, .num_sge = 1};
+    struct ibv_recv_wr *bad;
+    fprintf(stderr, "Posting receive for buf at %p...\n", buf);
+    int ret = ibv_post_recv(qp, &wr, &bad);
+    if (ret) {
+        fprintf(stderr, "Failed to post RECV: %s\n", strerror(ret));
+    }
+    return ret;
 }
 
 static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
                          uint32_t send_flags) {
-  struct ibv_sge sge = {
-      .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
-  struct ibv_send_wr wr = {.wr_id = 2,
-                           .sg_list = &sge,
-                           .num_sge = 1,
-                           .opcode = IBV_WR_SEND,
-                           .send_flags = send_flags};
-  struct ibv_send_wr *bad;
-  fprintf(stderr, "Posting send buffer...\n");
-  int ret = ibv_post_send(qp, &wr, &bad);
-  if (ret) {
-    fprintf(stderr, "Failed to post SEND\n");
-  }
-  return ret;
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
+    struct ibv_send_wr wr = {.wr_id = 2,
+                             .sg_list = &sge,
+                             .num_sge = 1,
+                             .opcode = IBV_WR_SEND,
+                             .send_flags = send_flags};
+    struct ibv_send_wr *bad;
+    fprintf(stderr, "Posting send for buf at %p...\n", buf);
+    int ret = ibv_post_send(qp, &wr, &bad);
+    if (ret) {
+        fprintf(stderr, "Failed to post SEND: %s\n", strerror(ret));
+    }
+    return ret;
 }
 
 int main(int argc, char *argv[]) {

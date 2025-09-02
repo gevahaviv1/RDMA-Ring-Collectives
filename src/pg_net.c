@@ -396,19 +396,32 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     my_left.psn  = lrand48() & 0xFFFFFF;
     my_right.psn = lrand48() & 0xFFFFFF;
 
-    // 3. Exchange bootstrap info with left and right neighbors.
-    // Left socket: we expect peer's RIGHT QP; we provide our LEFT QP.
-    fprintf(stderr, "[boot] exch with left: send qp_left=%u, recv peer_right\n", my_left.qpn);
-    if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
-        fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
-        return -1;
-    }
-
-    // Right socket: we expect peer's LEFT QP; we provide our RIGHT QP.
-    fprintf(stderr, "[boot] exch with right: send qp_right=%u, recv peer_left\n", my_right.qpn);
-    if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
-        fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
-        return -1;
+    // 3. Exchange bootstrap info with neighbors.
+    // Classic ring-safe ordering:
+    //   - rank 0: send-first to right, then recv-first from left
+    //   - others: recv-first from left, then send-first to right
+    if (pg->rank == 0) {
+        fprintf(stderr, "[boot] (rank0) exch with right (send-first): send qp_right=%u, then recv peer_left\n", my_right.qpn);
+        if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
+            fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
+            return -1;
+        }
+        fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send qp_left=%u\n", my_left.qpn);
+        if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
+            fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send qp_left=%u\n", my_left.qpn);
+        if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
+            fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
+            return -1;
+        }
+        fprintf(stderr, "[boot] exch with right (send-first): send qp_right=%u, then recv peer_left\n", my_right.qpn);
+        if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
+            fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
+            return -1;
+        }
     }
 
     // 4. Transition local QPs to RTR and RTS using received remote info.

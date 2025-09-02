@@ -125,24 +125,18 @@ int main(int argc, char *argv[]) {
   }
 
   // === Ring Ping Test ===
-  // Assume pg_handle exposes left_qp, right_qp, pd, cq
-  int send_val = myindex * 100;  // unique per rank
-  int recv_val = -1;
+  // Use the library's pre-registered buffer for communication
+  // This avoids registering separate, small buffers and ensures we use the MR
+  // that the library's post_send/recv helpers expect.
+  int *send_buf = (int *)handle->buf; // Use the start of the buffer for sending
+  int *recv_buf = (int *)((char*)handle->buf + sizeof(int)); // Use an offset for receiving
 
-  // Register memory for send/recv
-  struct ibv_mr *send_mr =
-      ibv_reg_mr(handle->pd, &send_val, sizeof(int), IBV_ACCESS_LOCAL_WRITE);
-  struct ibv_mr *recv_mr =
-      ibv_reg_mr(handle->pd, &recv_val, sizeof(int), IBV_ACCESS_LOCAL_WRITE);
+  *send_buf = myindex; // Send our rank
+  *recv_buf = -1;      // Initialize with an invalid value
 
-  if (!send_mr || !recv_mr) {
-    perror("ibv_reg_mr");
-    return EXIT_FAILURE;
-  }
-
-  // Post RECV from left neighbor
+  // Post RECV from left neighbor using the library's MR
   fprintf(stderr, "Rank %d posting receive buffer...\n", myindex);
-  if (post_one_recv(handle->qp_left, recv_mr, &recv_val)) {
+  if (post_one_recv(handle->qp_left, handle->mr, recv_buf)) {
     fprintf(stderr, "Failed to post RECV\n");
     return EXIT_FAILURE;
   }
@@ -153,11 +147,11 @@ int main(int argc, char *argv[]) {
       return EXIT_FAILURE;
   }
 
-  // Post SEND to right neighbor
+  // Post SEND to right neighbor using the library's MR
   uint32_t flags = IBV_SEND_SIGNALED;
   if (handle->max_inline_data >= sizeof(int)) flags |= IBV_SEND_INLINE;
   fprintf(stderr, "Rank %d posting send to right...\n", myindex);
-  if (post_one_send(handle->qp_right, send_mr, &send_val, flags)) {
+  if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
     fprintf(stderr, "Failed to post SEND\n");
     return EXIT_FAILURE;
   }
@@ -174,19 +168,17 @@ int main(int argc, char *argv[]) {
       if (wc.status != IBV_WC_SUCCESS) {
         fprintf(stderr, "Work completion error: %s\n",
                 ibv_wc_status_str(wc.status));
-        break;
+        return EXIT_FAILURE;
       }
       completions++;
     }
   }
 
-  printf("Rank %d on host %s received %d from left neighbor\n", myindex,
-         hostname, recv_val);
+  fprintf(stderr, "Rank %d on host %s received %d from left neighbor\n", myindex,
+          hostname, *recv_buf);
 
-  // Cleanup
-  ibv_dereg_mr(send_mr);
-  ibv_dereg_mr(recv_mr);
+  // The library's MR will be deregistered by pg_close()
+
   pg_close(handle);
-
   return EXIT_SUCCESS;
 }

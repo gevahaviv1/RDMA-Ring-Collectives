@@ -1,10 +1,45 @@
+#include <arpa/inet.h>
 #include <infiniband/verbs.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "pg.h"  // your header with connect_process_group etc.
+
+// Simple TCP-based ring barrier for test synchronization
+static int tcp_barrier(struct pg *pg) {
+    char dummy_val = 'a';
+    int rank = pg->rank;
+    int world_size = pg->world_size;
+    int left_fd = pg->left_fd;
+    int right_fd = pg->right_fd;
+
+    for (int i = 0; i < world_size; i++) {
+        if (rank == i) {
+            if (send(right_fd, &dummy_val, sizeof(dummy_val), 0) != sizeof(dummy_val)) {
+                perror("barrier send");
+                return -1;
+            }
+            if (recv(left_fd, &dummy_val, sizeof(dummy_val), MSG_WAITALL) != sizeof(dummy_val)) {
+                perror("barrier recv");
+                return -1;
+            }
+        } else {
+            if (recv(left_fd, &dummy_val, sizeof(dummy_val), MSG_WAITALL) != sizeof(dummy_val)) {
+                perror("barrier recv");
+                return -1;
+            }
+            if (send(right_fd, &dummy_val, sizeof(dummy_val), 0) != sizeof(dummy_val)) {
+                perror("barrier send");
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
 
 // Simple helper: post one RECV
 static int post_one_recv(struct ibv_qp *qp, struct ibv_mr *mr, int *buf) {
@@ -89,6 +124,12 @@ int main(int argc, char *argv[]) {
   if (post_one_recv(handle->qp_left, recv_mr, &recv_val)) {
     fprintf(stderr, "Failed to post RECV\n");
     return EXIT_FAILURE;
+  }
+
+  // Synchronize all ranks to ensure RECVs are posted before SENDs
+  if (tcp_barrier(handle) != 0) {
+      fprintf(stderr, "TCP barrier failed\n");
+      return EXIT_FAILURE;
   }
 
   // Post SEND to right neighbor

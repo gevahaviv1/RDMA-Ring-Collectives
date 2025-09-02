@@ -479,7 +479,7 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
  * @brief Orchestrates the entire ring connection and bootstrap process.
  */
 int pgnet_ring_connect(struct pg *pg) {
-    int right = (pg->rank + 1) % pg->world;
+    int right = (pg->rank + 1) % pg->world_size;
 
     // Base settings with env overrides
     int base_port = pg->port ? pg->port : PG_DEFAULT_PORT;
@@ -489,9 +489,9 @@ int pgnet_ring_connect(struct pg *pg) {
 
     // Per-rank ports (consistent modulo scheme for all ranks)
     int listen_port = base_port + (pg->rank % 10000);
-    int right_rank  = (pg->rank + 1) % pg->world;
+    int right_rank  = (pg->rank + 1) % pg->world_size;
     int right_port  = base_port + (right_rank % 10000);
-    int left_rank   = (pg->rank - 1 + pg->world) % pg->world;
+    int left_rank   = (pg->rank - 1 + pg->world_size) % pg->world_size;
     int left_port   = base_port + (left_rank % 10000); (void)left_port; // for clarity/logs if needed
     const char *right_host = pg->hosts[right];
 
@@ -518,17 +518,21 @@ int pgnet_ring_connect(struct pg *pg) {
     close(listen_fd);
     listen_fd = -1;
 
+    // Store FDs in handle; they will be closed by pg_close()
+    pg->left_fd = left_fd;
+    pg->right_fd = right_fd;
+
     // Switch established sockets to blocking for robust full read/write
     int fl;
-    if ((fl = fcntl(left_fd, F_GETFL, 0)) >= 0) fcntl(left_fd, F_SETFL, fl & ~O_NONBLOCK);
-    if ((fl = fcntl(right_fd, F_GETFL, 0)) >= 0) fcntl(right_fd, F_SETFL, fl & ~O_NONBLOCK);
+    if ((fl = fcntl(pg->left_fd, F_GETFL, 0)) >= 0) fcntl(pg->left_fd, F_SETFL, fl & ~O_NONBLOCK);
+    if ((fl = fcntl(pg->right_fd, F_GETFL, 0)) >= 0) fcntl(pg->right_fd, F_SETFL, fl & ~O_NONBLOCK);
 
-    if (pgnet_exchange_bootstrap(left_fd, right_fd, pg) != 0) {
+    if (pgnet_exchange_bootstrap(pg->left_fd, pg->right_fd, pg) != 0) {
         goto fail;
     }
 
-    close(left_fd);
-    close(right_fd);
+    // Sockets are intentionally left open for potential use by test harnesses (e.g., barriers)
+    // pg_close() is responsible for closing them.
     return 0;
 
 fail:

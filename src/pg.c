@@ -190,7 +190,7 @@ int connect_process_group(const char *serverlist, void **out_handle) {
     struct pg *pg = calloc(1, sizeof(*pg));
     if (!pg) return -1;
 
-    if (parse_server_list(serverlist, self_host, (size_t *)&pg->world, (size_t *)&pg->rank, &pg->hosts) != 0) {
+    if (parse_server_list(serverlist, self_host, (size_t *)&pg->world_size, (size_t *)&pg->rank, &pg->hosts) != 0) {
         free(pg);
         return -1;
     }
@@ -227,7 +227,7 @@ int connect_process_group(const char *serverlist, void **out_handle) {
     if (rdma_qp_to_init(pg->qp_right, pg->ib_port, 1) != 0) goto fail;
 
     // Establish network connections and exchange bootstrap info
-    if (pg->world > 1) {
+    if (pg->world_size > 1) {
         if (pgnet_ring_connect(pg) != 0) goto fail;
     }
 
@@ -251,7 +251,7 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
     struct pg *pg = pg_handle;
     if (!pg || !sendbuf || !recvbuf || count < 0 || elem_size(dt) == 0) return -1;
 
-    if (pg->world == 1) {
+    if (pg->world_size == 1) {
         memcpy(recvbuf, sendbuf, (size_t)count * elem_size(dt));
         return 0;
     }
@@ -259,9 +259,9 @@ int pg_reduce_scatter(void *sendbuf, void *recvbuf, int count, DATATYPE dt,
     size_t chunk_elems = chunk_elems_from_bytes(pg->chunk_bytes, dt);
 
     // In a real implementation, this loop would be pipelined with RDMA operations.
-    for (int r = 0; r < pg->world - 1; ++r) {
-        int send_idx = rs_send_chunk_index(r, pg->rank, pg->world);
-        int recv_idx = rs_recv_chunk_index(r, pg->rank, pg->world);
+    for (int r = 0; r < pg->world_size - 1; ++r) {
+        int send_idx = rs_send_chunk_index(r, pg->rank, pg->world_size);
+        int recv_idx = rs_recv_chunk_index(r, pg->rank, pg->world_size);
 
         size_t send_off, send_len, recv_off, recv_len;
         chunk_offsets((size_t)count, chunk_elems, dt, (size_t)send_idx, &send_off, &send_len);
@@ -280,7 +280,7 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt, void *pg
     if (!pg || !recvbuf || count < 0 || elem_size(dt) == 0) return -1;
 
     size_t es = elem_size(dt);
-    size_t total_bytes = (size_t)count * (size_t)pg->world * es;
+    size_t total_bytes = (size_t)count * (size_t)pg->world_size * es;
     size_t rank_bytes = (size_t)count * es;
 
     // Copy local data into the correct slot in the final buffer.
@@ -288,12 +288,12 @@ int pg_all_gather(void *sendbuf, void *recvbuf, int count, DATATYPE dt, void *pg
         memcpy((char *)recvbuf + (size_t)pg->rank * rank_bytes, sendbuf, rank_bytes);
     }
 
-    if (pg->world == 1) return 0;
+    if (pg->world_size == 1) return 0;
 
     // In a real implementation, this would use RDMA to exchange data.
-    for (int r = 0; r < pg->world - 1; ++r) {
-        int send_rank_idx = (pg->rank - r + pg->world) % pg->world;
-        int recv_rank_idx = (pg->rank - r - 1 + pg->world) % pg->world;
+    for (int r = 0; r < pg->world_size - 1; ++r) {
+        int send_rank_idx = (pg->rank - r + pg->world_size) % pg->world_size;
+        int recv_rank_idx = (pg->rank - r - 1 + pg->world_size) % pg->world_size;
 
         void *sbuf = (char *)recvbuf + (size_t)send_rank_idx * rank_bytes;
         void *rbuf = (char *)recvbuf + (size_t)recv_rank_idx * rank_bytes;
@@ -342,10 +342,14 @@ static void pg_free_resources(struct pg *pg) {
     if (pg->pd)       ibv_dealloc_pd(pg->pd);
     if (pg->ctx)      ibv_close_device(pg->ctx);
 
+    // Close network sockets
+    if (pg->left_fd > 0)  close(pg->left_fd);
+    if (pg->right_fd > 0) close(pg->right_fd);
+
     // Free memory allocations.
     if (pg->buf)      free(pg->buf);
     if (pg->hosts) {
-        for (int i = 0; i < pg->world; ++i) {
+        for (int i = 0; i < pg->world_size; ++i) {
             free(pg->hosts[i]);
         }
         free(pg->hosts);

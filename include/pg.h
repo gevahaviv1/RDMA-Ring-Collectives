@@ -38,8 +38,8 @@ struct qp_boot {
  */
 struct pg {
   //-- Topology and Tuning Parameters --//
-  int      rank;          /**< This process's rank (0 to world-1). */
-  int      world;         /**< Total number of processes in the group. */
+  int      rank;          /**< This process's rank (0 to world_size-1). */
+  int      world_size;    /**< Total number of processes in the group. */
   size_t   chunk_bytes;   /**< Size of chunks for pipelined collectives. */
   size_t   eager_max;     /**< Eager protocol threshold in bytes. */
   int      inflight;      /**< Number of inflight chunks for pipelining. */
@@ -47,6 +47,8 @@ struct pg {
   //-- Bootstrap and Network Configuration --//
   char   **hosts;         /**< Array of hostnames for all ranks. */
   int      port;          /**< TCP port for bootstrap connections. */
+  int      left_fd;       /**< TCP socket for left neighbor. */
+  int      right_fd;      /**< TCP socket for right neighbor. */
   uint8_t  ib_port;       /**< InfiniBand device port (1-based). */
   uint8_t  gid_index;     /**< GID index for RoCEv2. */
 

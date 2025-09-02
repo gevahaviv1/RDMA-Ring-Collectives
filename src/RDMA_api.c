@@ -115,20 +115,54 @@ int rdma_qp_to_init(struct ibv_qp *qp, uint8_t port, int allow_remote_rw) {
     // Pick a valid P_Key index. Prefer default partition key 0x7fff if present.
     uint16_t pkey = 0;
     uint16_t pkey_index = 0;
+    int have_choice = 0;
+    int env_index = -1;
+    unsigned env_pkey = 0;
+    const char *s_idx = getenv("PG_PKEY_INDEX");
+    const char *s_val = getenv("PG_PKEY");
+    if (s_idx) env_index = atoi(s_idx);
+    if (s_val) {
+        if (strncasecmp(s_val, "0x", 2) == 0) sscanf(s_val + 2, "%x", &env_pkey);
+        else sscanf(s_val, "%x", &env_pkey);
+        env_pkey &= 0xFFFFu;
+    }
     struct ibv_port_attr port_attr;
     memset(&port_attr, 0, sizeof(port_attr));
     if (ibv_query_port(qp->context, port, &port_attr) == 0) {
         int n = port_attr.pkey_tbl_len;
+        uint16_t first_default = 0xFFFF;
+        uint16_t first_full_default = 0xFFFF;
         for (int i = 0; i < n; ++i) {
-            if (ibv_query_pkey(qp->context, port, (int)i, &pkey) == 0) {
-                // Default partition has lower 15 bits 0x7fff; prefer full membership (bit 15 set)
-                if ((pkey & 0x7fff) == 0x7fff) { pkey_index = (uint16_t)i; break; }
+            uint16_t val = 0;
+            if (ibv_query_pkey(qp->context, port, (int)i, &val) != 0) continue;
+            // If env index is set, prefer it directly
+            if (env_index >= 0 && i == env_index) { pkey_index = (uint16_t)i; pkey = val; have_choice = 1; break; }
+            // If env value is set, prefer exact match
+            if (s_val && val == (uint16_t)env_pkey) { pkey_index = (uint16_t)i; pkey = val; have_choice = 1; break; }
+            // Track candidates: default partition lower 15 bits 0x7fff
+            if ((val & 0x7fff) == 0x7fff) {
+                if (first_default == 0xFFFF) first_default = (uint16_t)i;
+                if ((val & 0x8000) && first_full_default == 0xFFFF) first_full_default = (uint16_t)i;
+            }
+        }
+        if (!have_choice) {
+            if (first_full_default != 0xFFFF) {
+                pkey_index = first_full_default;
+                ibv_query_pkey(qp->context, port, pkey_index, &pkey);
+            } else if (first_default != 0xFFFF) {
+                pkey_index = first_default;
+                ibv_query_pkey(qp->context, port, pkey_index, &pkey);
+            } else {
+                // Fallback to index 0
+                ibv_query_pkey(qp->context, port, 0, &pkey);
+                pkey_index = 0;
             }
         }
     }
     attr.pkey_index = pkey_index;
-    fprintf(stderr, "[rdma] QP%u INIT on port %u with pkey_index=%u\n",
-            qp->qp_num, (unsigned)port, (unsigned)pkey_index);
+    fprintf(stderr, "[rdma] QP%u INIT on port %u with pkey_index=%u pkey=0x%04x (link=%s)\n",
+            qp->qp_num, (unsigned)port, (unsigned)pkey_index, pkey,
+            (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET ? "RoCE" : "IB"));
     attr.port_num = port;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
                            (allow_remote_rw ? (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ) : 0);

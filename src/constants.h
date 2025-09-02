@@ -18,6 +18,22 @@
  */
 #define PG_DEFAULT_PORT 18515
 
+/**
+ * @brief Default overall TCP bootstrap connect/accept timeout in milliseconds.
+ * Overridden by the PG_CONNECT_TIMEOUT_MS environment variable.
+ */
+#ifndef PG_DEFAULT_CONNECT_TIMEOUT_MS
+#define PG_DEFAULT_CONNECT_TIMEOUT_MS 8000
+#endif
+
+/**
+ * @brief Default backoff between TCP connect retries in milliseconds.
+ * Overridden by the PG_BACKOFF_MS environment variable.
+ */
+#ifndef PG_DEFAULT_BACKOFF_MS
+#define PG_DEFAULT_BACKOFF_MS 100
+#endif
+
 //==============================================================================
 // RDMA Resource and QP Defaults
 //==============================================================================

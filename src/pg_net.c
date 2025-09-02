@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "pg_internal.h"
 #include "RDMA_api.h"
@@ -33,7 +34,9 @@ static int pgnet_write_full(int fd, const void *buf, size_t len) {
     while (len > 0) {
         ssize_t n = send(fd, p, len, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+                continue;
+            }
             fprintf(stderr, "pgnet_write_full failed: %s\n", strerror(errno));
             return -1;
         }
@@ -53,7 +56,9 @@ static int pgnet_read_full(int fd, void *buf, size_t len) {
     while (len > 0) {
         ssize_t n = recv(fd, p, len, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+                continue;
+            }
             fprintf(stderr, "pgnet_read_full failed: %s\n",
                     (n == 0) ? "peer closed connection" : strerror(errno));
             return -1;
@@ -65,19 +70,41 @@ static int pgnet_read_full(int fd, void *buf, size_t len) {
 }
 
 //==============================================================================
+// Time and Env Helpers
+//==============================================================================
+
+static inline int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int getenv_int(const char *name, int fallback) {
+    const char *s = getenv(name);
+    if (!s || !*s) return fallback;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || v <= 0 || v > 1<<30) return fallback;
+    return (int)v;
+}
+
+//==============================================================================
 // TCP Connection Setup
 //==============================================================================
 
 /**
- * @brief Creates a non-blocking listening socket bound to 'portstr'.
+ * @brief Creates a non-blocking listening socket bound to INADDR_ANY:port.
  * @return 0 on success, -1 on failure.
  */
-static int pgnet_setup_listen_socket(const char *portstr, int *listen_fd_out) {
+static int pgnet_setup_listen_socket(int port, int *listen_fd_out) {
     struct addrinfo hints, *ai = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE;
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
 
     if (getaddrinfo(NULL, portstr, &hints, &ai) != 0) {
         fprintf(stderr, "getaddrinfo failed for port %s\n", portstr);
@@ -94,6 +121,9 @@ static int pgnet_setup_listen_socket(const char *portstr, int *listen_fd_out) {
     fcntl(fd, F_SETFL, O_NONBLOCK);
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
 
     if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
         fprintf(stderr, "bind() to port %s failed: %s\n", portstr, strerror(errno));
@@ -115,14 +145,17 @@ static int pgnet_setup_listen_socket(const char *portstr, int *listen_fd_out) {
 }
 
 /**
- * @brief Initiates a non-blocking connect to 'host:portstr'.
+ * @brief Initiates a non-blocking connect to host:port.
  * @return 0 on success (or in-progress), -1 on immediate failure.
  */
-static int pgnet_connect_right_nonblocking(const char *host, const char *portstr, int *conn_fd_out) {
+static int pgnet_connect_nonblocking(const char *host, int port, int *conn_fd_out) {
     struct addrinfo hints, *ai = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
 
     if (getaddrinfo(host, portstr, &hints, &ai) != 0) {
         fprintf(stderr, "getaddrinfo failed for host %s\n", host);
@@ -141,7 +174,6 @@ static int pgnet_connect_right_nonblocking(const char *host, const char *portstr
     freeaddrinfo(ai);
 
     if (rc != 0 && errno != EINPROGRESS) {
-        fprintf(stderr, "connect() to %s:%s failed: %s\n", host, portstr, strerror(errno));
         close(fd);
         return -1;
     }
@@ -152,55 +184,117 @@ static int pgnet_connect_right_nonblocking(const char *host, const char *portstr
 
 /**
  * @brief Polls until the inbound accept (from left) and outbound connect (to right) complete.
+ * Retries connect on transient failures until deadline.
  * @return 0 on success, -1 on timeout or error.
  */
-static int pgnet_poll_until_ready(int listen_fd, int conn_fd, int *left_fd_out, int *right_fd_out) {
+static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int right_port,
+                                  int timeout_ms, int backoff_ms,
+                                  int *left_fd_out, int *right_fd_out) {
+    int64_t start = now_ms();
+    int64_t deadline = start + timeout_ms;
+    int left_fd = -1;
+    int right_fd = -1;
+    int conn_fd = -1;
+    int64_t next_attempt = start; // immediate first attempt
+
     struct pollfd pfds[2];
+    memset(pfds, 0, sizeof(pfds));
     pfds[0].fd = listen_fd;
     pfds[0].events = POLLIN;
-    pfds[1].fd = conn_fd;
+    pfds[1].fd = -1;
     pfds[1].events = POLLOUT;
-    int timeout_ms = 30000; // Increased timeout
 
-    int left_fd = -1, right_fd = -1;
-    while (left_fd < 0 || right_fd < 0) {
-        int rc = poll(pfds, 2, timeout_ms);
+    while ((left_fd < 0 || right_fd < 0) && now_ms() < deadline) {
+        int64_t now = now_ms();
+
+        // Initiate or re-initiate non-blocking connect as needed
+        if (right_fd < 0 && conn_fd < 0 && now >= next_attempt) {
+            if (pgnet_connect_nonblocking(right_host, right_port, &conn_fd) == 0) {
+                pfds[1].fd = conn_fd;
+#ifdef PG_DEBUG
+                fprintf(stderr, "[net] retrying connect... (%lld ms elapsed)\n",
+                        (long long)(now - start));
+#endif
+            } else {
+                // immediate failure, schedule next attempt
+                next_attempt = now + backoff_ms;
+            }
+        }
+
+        int poll_ms;
+        if (conn_fd < 0) {
+            // No outgoing connect fd yet: wait until next_attempt or deadline
+            int64_t until_next = next_attempt - now;
+            if (until_next < 0) until_next = 0;
+            int64_t until_deadline = deadline - now;
+            poll_ms = (int)((until_next < until_deadline) ? until_next : until_deadline);
+        } else {
+            // Have an outstanding connect; poll both fds with a small timeout
+            int64_t until_deadline = deadline - now;
+            poll_ms = (int)((until_deadline > backoff_ms) ? backoff_ms : until_deadline);
+        }
+        if (poll_ms < 0) poll_ms = 0;
+
+        nfds_t nfds = (conn_fd >= 0) ? 2 : 1;
+        int rc = poll(pfds, nfds, poll_ms);
         if (rc < 0) {
+            if (errno == EINTR) continue;
             fprintf(stderr, "poll() failed: %s\n", strerror(errno));
             break;
         }
-        if (rc == 0) {
-            fprintf(stderr, "poll() timed out waiting for connections\n");
-            break;
-        }
 
+        // Accept from left (non-blocking)
         if (left_fd < 0 && (pfds[0].revents & POLLIN)) {
-            left_fd = accept(listen_fd, NULL, NULL);
-            if (left_fd >= 0) {
-                fcntl(left_fd, F_SETFL, fcntl(left_fd, F_GETFL, 0) & ~O_NONBLOCK);
-            }
-        }
-
-        if (right_fd < 0 && (pfds[1].revents & (POLLOUT | POLLERR | POLLHUP))) {
-            int err = 0;
-            socklen_t errlen = sizeof(err);
-            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err) {
-                fprintf(stderr, "connect to right neighbor failed: %s\n", strerror(err));
+            int fd = accept(listen_fd, NULL, NULL);
+            if (fd >= 0) {
+                // Keep sockets non-blocking to ensure robust I/O; our read/write handle EAGAIN
+                left_fd = fd;
+#ifdef PG_DEBUG
+                fprintf(stderr, "[net] accept left OK\n");
+#endif
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                fprintf(stderr, "accept() failed: %s\n", strerror(errno));
                 break;
             }
-            right_fd = conn_fd;
-            fcntl(right_fd, F_SETFL, fcntl(right_fd, F_GETFL, 0) & ~O_NONBLOCK);
+        }
+
+        // Check outgoing connect progress
+        if (right_fd < 0 && conn_fd >= 0 && (pfds[1].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            int err = 0;
+            socklen_t errlen = sizeof(err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) err = errno;
+            if (err == 0) {
+                right_fd = conn_fd;
+                conn_fd = -1;
+                pfds[1].fd = -1;
+#ifdef PG_DEBUG
+                fprintf(stderr, "[net] connect right OK\n");
+#endif
+            } else {
+                // transient failure: retry until deadline
+                if (err == ECONNREFUSED || err == ETIMEDOUT || err == EHOSTUNREACH) {
+                    close(conn_fd);
+                    conn_fd = -1;
+                    pfds[1].fd = -1;
+                    next_attempt = now_ms() + backoff_ms;
+                } else {
+                    fprintf(stderr, "connect() failed: %s\n", strerror(err));
+                    close(conn_fd);
+                    conn_fd = -1;
+                    break;
+                }
+            }
         }
     }
 
+    if (conn_fd >= 0) { close(conn_fd); }
     if (left_fd >= 0 && right_fd >= 0) {
         *left_fd_out = left_fd;
         *right_fd_out = right_fd;
         return 0;
     }
-
     if (left_fd >= 0) close(left_fd);
-    // conn_fd is closed by the caller's fail path
+    if (right_fd >= 0) close(right_fd);
     return -1;
 }
 
@@ -276,27 +370,35 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
  */
 int pgnet_ring_connect(struct pg *pg) {
     int right = (pg->rank + 1) % pg->world;
-    char portstr[16];
-    snprintf(portstr, sizeof(portstr), "%d", pg->port);
 
-    int listen_fd = -1, conn_fd = -1, left_fd = -1, right_fd = -1;
+    // Base settings with env overrides
+    int base_port = pg->port ? pg->port : PG_DEFAULT_PORT;
+    base_port = getenv_int("PG_PORT", base_port);
+    int timeout_ms = getenv_int("PG_CONNECT_TIMEOUT_MS", PG_DEFAULT_CONNECT_TIMEOUT_MS);
+    int backoff_ms = getenv_int("PG_BACKOFF_MS", PG_DEFAULT_BACKOFF_MS);
 
-    if (pgnet_setup_listen_socket(portstr, &listen_fd) != 0) goto fail;
+    // Per-rank ports
+    int listen_port = base_port + (pg->rank % 10000);
+    int right_port  = base_port + ((pg->rank + 1) % pg->world);
+    int left_rank   = (pg->rank - 1 + pg->world) % pg->world;
+    int left_port   = base_port + left_rank; (void)left_port; // for clarity/logs if needed
 
-    // Ranks connect in a ring. To avoid deadlock, rank 0 connects first, then
-    // others wait briefly before connecting to allow listeners to be ready.
-    if (pg->rank != 0) usleep(100 * 1000);
+#ifdef PG_DEBUG
+    fprintf(stderr, "[net] rank=%d listen=%s:%d right=%s:%d timeout=%dms\n",
+            pg->rank, "*", listen_port, pg->hosts[right], right_port, timeout_ms);
+#endif
 
-    if (pgnet_connect_right_nonblocking(pg->hosts[right], portstr, &conn_fd) != 0) {
-        goto fail;
-    }
+    int listen_fd = -1, left_fd = -1, right_fd = -1;
+    if (pgnet_setup_listen_socket(listen_port, &listen_fd) != 0) goto fail;
 
-    if (pgnet_poll_until_ready(listen_fd, conn_fd, &left_fd, &right_fd) != 0) {
+    // Single loop handles both accept and connect with retry/backoff until timeout
+    if (pgnet_poll_until_ready(listen_fd, pg->hosts[right], right_port,
+                               timeout_ms, backoff_ms, &left_fd, &right_fd) != 0) {
         goto fail;
     }
 
     close(listen_fd);
-    listen_fd = -1; // Mark as closed
+    listen_fd = -1;
 
     if (pgnet_exchange_bootstrap(left_fd, right_fd, pg) != 0) {
         goto fail;
@@ -308,7 +410,6 @@ int pgnet_ring_connect(struct pg *pg) {
 
 fail:
     if (listen_fd >= 0) close(listen_fd);
-    if (conn_fd >= 0 && conn_fd != right_fd) close(conn_fd);
     if (left_fd >= 0) close(left_fd);
     if (right_fd >= 0) close(right_fd);
     return -1;

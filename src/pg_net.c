@@ -12,6 +12,7 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <signal.h>
 
 #include "pg_internal.h"
 #include "RDMA_api.h"
@@ -159,37 +160,44 @@ static int pgnet_setup_listen_socket(int port, int *listen_fd_out) {
  * @return 0 on success (or in-progress), -1 on immediate failure.
  */
 static int pgnet_connect_nonblocking(const char *host, int port, int *conn_fd_out) {
-    struct addrinfo hints, *ai = NULL;
+    struct addrinfo hints, *ai = NULL, *rp = NULL;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
+    hints.ai_family = AF_INET;      // force IPv4 to match INADDR_ANY listener
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
     char portstr[16];
     snprintf(portstr, sizeof(portstr), "%d", port);
 
-    if (getaddrinfo(host, portstr, &hints, &ai) != 0) {
-        fprintf(stderr, "getaddrinfo failed for host %s\n", host);
+    int rc_gai = getaddrinfo(host, portstr, &hints, &ai);
+    if (rc_gai != 0) {
+        fprintf(stderr, "getaddrinfo(%s:%s) failed: %s\n", host, portstr, gai_strerror(rc_gai));
         return -1;
     }
 
-    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (fd < 0) {
-        fprintf(stderr, "socket() failed: %s\n", strerror(errno));
-        freeaddrinfo(ai);
-        return -1;
-    }
-
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-    freeaddrinfo(ai);
-
-    if (rc != 0 && errno != EINPROGRESS) {
+    int fd = -1;
+    int rc = -1;
+    for (rp = ai; rp; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        // Non-blocking
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        rc = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (rc == 0 || (rc != 0 && errno == EINPROGRESS)) {
+            // Success (immediate or in-progress)
+            *conn_fd_out = fd;
+            freeaddrinfo(ai);
+            return 0;
+        }
+        // Immediate failure for this addrinfo; try next
         close(fd);
-        return -1;
+        fd = -1;
     }
 
-    *conn_fd_out = fd;
-    return 0;
+    freeaddrinfo(ai);
+    return -1;
 }
 
 /**
@@ -259,9 +267,7 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
             if (fd >= 0) {
                 // Keep sockets non-blocking to ensure robust I/O; our read/write handle EAGAIN
                 left_fd = fd;
-#ifdef PG_DEBUG
                 fprintf(stderr, "[net] rank=%d accept left OK\n", rank);
-#endif
             } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 fprintf(stderr, "accept() failed: %s\n", strerror(errno));
                 break;
@@ -277,12 +283,11 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 right_fd = conn_fd;
                 conn_fd = -1;
                 pfds[1].fd = -1;
-#ifdef PG_DEBUG
                 fprintf(stderr, "[net] rank=%d connect right OK\n", rank);
-#endif
             } else {
                 // transient failure: retry until deadline
-                if (err == ECONNREFUSED || err == ETIMEDOUT || err == EHOSTUNREACH) {
+                if (err == ECONNREFUSED || err == ETIMEDOUT || err == EHOSTUNREACH ||
+                    err == ENETUNREACH || err == ENETDOWN || err == EADDRNOTAVAIL) {
                     close(conn_fd);
                     conn_fd = -1;
                     pfds[1].fd = -1;
@@ -293,6 +298,17 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                     conn_fd = -1;
                     break;
                 }
+            }
+        }
+
+        // If we have an in-progress connect but poll didn't flag it, periodically probe SO_ERROR.
+        if (right_fd < 0 && conn_fd >= 0 && pfds[1].revents == 0) {
+            int err = 0; socklen_t errlen = sizeof(err);
+            if (getsockopt(conn_fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0 && err == 0) {
+                right_fd = conn_fd;
+                conn_fd = -1;
+                pfds[1].fd = -1;
+                fprintf(stderr, "[net] rank=%d connect right OK\n", rank);
             }
         }
     }
@@ -402,6 +418,9 @@ int pgnet_ring_connect(struct pg *pg) {
             pg->rank, "*", listen_port, pg->hosts[right], right_port, timeout_ms);
 #endif
 
+    // Avoid SIGPIPE crashes on send() after peer closes
+    signal(SIGPIPE, SIG_IGN);
+
     int listen_fd = -1, left_fd = -1, right_fd = -1;
     if (pgnet_setup_listen_socket(listen_port, &listen_fd) != 0) goto fail;
 
@@ -413,6 +432,11 @@ int pgnet_ring_connect(struct pg *pg) {
 
     close(listen_fd);
     listen_fd = -1;
+
+    // Switch established sockets to blocking for robust full read/write
+    int fl;
+    if ((fl = fcntl(left_fd, F_GETFL, 0)) >= 0) fcntl(left_fd, F_SETFL, fl & ~O_NONBLOCK);
+    if ((fl = fcntl(right_fd, F_GETFL, 0)) >= 0) fcntl(right_fd, F_SETFL, fl & ~O_NONBLOCK);
 
     if (pgnet_exchange_bootstrap(left_fd, right_fd, pg) != 0) {
         goto fail;

@@ -371,9 +371,15 @@ static int pgnet_exchange_qp(int fd, const struct qp_boot *local, struct qp_boot
  * @return 0 on success, -1 on failure.
  */
 static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
-    // 1. Query local GID for RoCE addressing.
+    // 1. Query local addressing: GID for RoCE and LID for InfiniBand
     union ibv_gid local_gid;
     if (rdma_query_gid(pg->ctx, pg->ib_port, pg->gid_index, &local_gid) != 0) {
+        return -1;
+    }
+    struct ibv_port_attr port_attr;
+    memset(&port_attr, 0, sizeof(port_attr));
+    if (ibv_query_port(pg->ctx, pg->ib_port, &port_attr) != 0) {
+        fprintf(stderr, "Failed to query port attributes for port %u\n", pg->ib_port);
         return -1;
     }
 
@@ -386,6 +392,7 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     // Common fields
     memcpy(my_left.gid, &local_gid, 16);
     memcpy(my_right.gid, &local_gid, 16);
+    my_left.lid = my_right.lid = port_attr.lid;
     my_left.addr = my_right.addr = (uintptr_t)pg->mr->addr;
     my_left.rkey = my_right.rkey = pg->mr->rkey;
     my_left.bytes = my_right.bytes = pg->mr->length;

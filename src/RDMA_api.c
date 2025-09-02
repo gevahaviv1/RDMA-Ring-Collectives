@@ -130,30 +130,47 @@ int rdma_qp_to_init(struct ibv_qp *qp, uint8_t port, int allow_remote_rw) {
 int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint8_t sgid_index, enum ibv_mtu mtu) {
     if (!qp || !remote || port == 0) return -1;
 
+    struct ibv_port_attr port_attr;
+    memset(&port_attr, 0, sizeof(port_attr));
+    if (ibv_query_port(qp->context, port, &port_attr) != 0) {
+        fprintf(stderr, "Failed to query port attributes for port %u\n", port);
+        return -1;
+    }
+
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = mtu;
+    // Clamp to active MTU on the link
+    attr.path_mtu = (port_attr.active_mtu < mtu) ? port_attr.active_mtu : mtu;
     attr.dest_qp_num = remote->qpn;
     attr.rq_psn = remote->psn;
     attr.max_dest_rd_atomic = 1;
     attr.min_rnr_timer = 12; // 0.64ms, a common default
 
-    // Address vector for RoCEv2
-    attr.ah_attr.is_global = 1;
-    memcpy(&attr.ah_attr.grh.dgid, remote->gid, 16);
-    attr.ah_attr.grh.sgid_index = sgid_index;
-    attr.ah_attr.grh.hop_limit = 64; // Allow routing across multiple L3 hops
-    attr.ah_attr.dlid = 0;          // Not used with RoCE/GRH
+    // Address vector depends on link layer
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.port_num = port;
 
     int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-    // Debug hint about remote addressing
-    fprintf(stderr, "[rdma] to RTR: remote qpn=%u rq_psn=%u mtu=%d gid[0]=%02x\n",
-            remote->qpn, remote->psn, (int)mtu, remote->gid[0]);
+
+    if (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
+        // RoCEv2: use global routing via GIDs
+        attr.ah_attr.is_global = 1;
+        memcpy(&attr.ah_attr.grh.dgid, remote->gid, 16);
+        attr.ah_attr.grh.sgid_index = sgid_index;
+        attr.ah_attr.grh.hop_limit = 64;
+        attr.ah_attr.dlid = 0; // not used on RoCE
+        fprintf(stderr, "[rdma] to RTR: RoCE remote qpn=%u rq_psn=%u mtu=%d gid[0]=%02x\n",
+                remote->qpn, remote->psn, (int)mtu, remote->gid[0]);
+    } else {
+        // InfiniBand: address by LID; no GRH
+        attr.ah_attr.is_global = 0;
+        attr.ah_attr.dlid = remote->lid;
+        fprintf(stderr, "[rdma] to RTR: IB remote qpn=%u rq_psn=%u mtu=%d lid=%u\n",
+                remote->qpn, remote->psn, (int)mtu, (unsigned)remote->lid);
+    }
 
     if (ibv_modify_qp(qp, &attr, mask)) {
         fprintf(stderr, "Failed to transition QP to RTR state\n");

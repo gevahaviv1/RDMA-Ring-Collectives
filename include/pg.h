@@ -26,6 +26,7 @@ struct qp_boot {
   uint32_t qpn;       /**< Queue Pair Number of the sender's QP. */
   uint32_t psn;       /**< Packet Sequence Number for the first packet. */
   uint8_t  gid[16];   /**< Global Identifier (GID) for RoCEv2 addressing. */
+  uint16_t lid;       /**< Local Identifier (LID) for InfiniBand addressing. */
   uint64_t addr;      /**< Base address of the registered memory region (MR). */
   uint32_t rkey;      /**< Remote key for accessing the MR. */
   uint32_t bytes;     /**< Total size of the MR in bytes. */

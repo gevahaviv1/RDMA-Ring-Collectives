@@ -51,6 +51,10 @@ void pg_init_env(struct pg *pg) {
     if (!pg->port && (s = getenv("PG_PORT"))) {
         pg->port = atoi(s);
     }
+    if (!pg->gid_index && (s = getenv("PG_GID_INDEX"))) {
+        int idx = atoi(s);
+        if (idx >= 0 && idx < 128) pg->gid_index = (uint8_t)idx;
+    }
 }
 
 /**
@@ -201,6 +205,7 @@ int connect_process_group(const char *serverlist, void **out_handle) {
     pg->inflight = PG_DEFAULT_INFLIGHT;
     pg->port = PG_DEFAULT_PORT;
     pg->ib_port = PG_DEFAULT_IB_PORT;
+    pg->gid_index = PG_DEFAULT_GID_INDEX;
     pg_init_env(pg);
 
     // Initialize RDMA resources

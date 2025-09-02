@@ -377,22 +377,36 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         return -1;
     }
 
-    // 2. Populate local bootstrap info.
-    struct qp_boot myinfo;
-    memset(&myinfo, 0, sizeof(myinfo));
-    myinfo.qpn = pg->qp_left->qp_num; // Use one QP for both directions' identity
-    myinfo.psn = lrand48() & 0xFFFFFF;
-    memcpy(myinfo.gid, &local_gid, 16);
-    myinfo.addr = (uintptr_t)pg->mr->addr;
-    myinfo.rkey = pg->mr->rkey;
-    myinfo.bytes = pg->mr->length;
+    // 2. Populate local bootstrap info for each neighbor/direction.
+    struct qp_boot my_left;  // info for our QP that talks to LEFT neighbor
+    struct qp_boot my_right; // info for our QP that talks to RIGHT neighbor
+    memset(&my_left, 0, sizeof(my_left));
+    memset(&my_right, 0, sizeof(my_right));
+
+    // Common fields
+    memcpy(my_left.gid, &local_gid, 16);
+    memcpy(my_right.gid, &local_gid, 16);
+    my_left.addr = my_right.addr = (uintptr_t)pg->mr->addr;
+    my_left.rkey = my_right.rkey = pg->mr->rkey;
+    my_left.bytes = my_right.bytes = pg->mr->length;
+
+    // Direction-specific fields
+    my_left.qpn  = pg->qp_left->qp_num;
+    my_right.qpn = pg->qp_right->qp_num;
+    my_left.psn  = lrand48() & 0xFFFFFF;
+    my_right.psn = lrand48() & 0xFFFFFF;
 
     // 3. Exchange bootstrap info with left and right neighbors.
-    if (pgnet_exchange_qp(left_fd, &myinfo, &pg->left_qp, 0) != 0) {
+    // Left socket: we expect peer's RIGHT QP; we provide our LEFT QP.
+    fprintf(stderr, "[boot] exch with left: send qp_left=%u, recv peer_right\n", my_left.qpn);
+    if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
         fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
         return -1;
     }
-    if (pgnet_exchange_qp(right_fd, &myinfo, &pg->right_qp, 1) != 0) {
+
+    // Right socket: we expect peer's LEFT QP; we provide our RIGHT QP.
+    fprintf(stderr, "[boot] exch with right: send qp_right=%u, recv peer_left\n", my_right.qpn);
+    if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
         fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
         return -1;
     }
@@ -401,8 +415,8 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     enum ibv_mtu mtu = IBV_MTU_1024;
     if (rdma_qp_to_rtr(pg->qp_left, &pg->left_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
     if (rdma_qp_to_rtr(pg->qp_right, &pg->right_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
-    if (rdma_qp_to_rts(pg->qp_left, myinfo.psn) != 0) return -1;
-    if (rdma_qp_to_rts(pg->qp_right, myinfo.psn) != 0) return -1;
+    if (rdma_qp_to_rts(pg->qp_left, my_left.psn) != 0) return -1;
+    if (rdma_qp_to_rts(pg->qp_right, my_right.psn) != 0) return -1;
 
     // 5. Query and store the actual max inline data size supported.
     if (rdma_qp_query_inline(pg->qp_left, &pg->max_inline_data) != 0) {

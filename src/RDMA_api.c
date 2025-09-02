@@ -111,7 +111,24 @@ int rdma_qp_to_init(struct ibv_qp *qp, uint8_t port, int allow_remote_rw) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_INIT;
-    attr.pkey_index = 0;
+
+    // Pick a valid P_Key index. Prefer default partition key 0x7fff if present.
+    uint16_t pkey = 0;
+    uint16_t pkey_index = 0;
+    struct ibv_port_attr port_attr;
+    memset(&port_attr, 0, sizeof(port_attr));
+    if (ibv_query_port(qp->context, port, &port_attr) == 0) {
+        int n = port_attr.pkey_tbl_len;
+        for (int i = 0; i < n; ++i) {
+            if (ibv_query_pkey(qp->context, port, (int)i, &pkey) == 0) {
+                // Default partition has lower 15 bits 0x7fff; prefer full membership (bit 15 set)
+                if ((pkey & 0x7fff) == 0x7fff) { pkey_index = (uint16_t)i; break; }
+            }
+        }
+    }
+    attr.pkey_index = pkey_index;
+    fprintf(stderr, "[rdma] QP%u INIT on port %u with pkey_index=%u\n",
+            qp->qp_num, (unsigned)port, (unsigned)pkey_index);
     attr.port_num = port;
     attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE |
                            (allow_remote_rw ? (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ) : 0);

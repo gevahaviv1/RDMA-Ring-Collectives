@@ -268,6 +268,13 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 // Keep sockets non-blocking to ensure robust I/O; our read/write handle EAGAIN
                 left_fd = fd;
                 fprintf(stderr, "[net] rank=%d accept left OK\n", rank);
+                // Optional: report peer endpoint
+                struct sockaddr_in peer; socklen_t pl = sizeof peer;
+                if (getpeername(left_fd, (struct sockaddr*)&peer, &pl) == 0) {
+                    char ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+                    fprintf(stderr, "[net] rank=%d accepted from left %s:%u\n", rank, ip, ntohs(peer.sin_port));
+                }
             } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                 fprintf(stderr, "accept() failed: %s\n", strerror(errno));
                 break;
@@ -284,6 +291,13 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 conn_fd = -1;
                 pfds[1].fd = -1;
                 fprintf(stderr, "[net] rank=%d connect right OK\n", rank);
+                // Optional: report peer endpoint
+                struct sockaddr_in peer; socklen_t prl = sizeof peer;
+                if (getpeername(right_fd, (struct sockaddr*)&peer, &prl) == 0) {
+                    char ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+                    fprintf(stderr, "[net] rank=%d connected to right %s:%u\n", rank, ip, ntohs(peer.sin_port));
+                }
             } else {
                 // transient failure: retry until deadline
                 if (err == ECONNREFUSED || err == ETIMEDOUT || err == EHOSTUNREACH ||
@@ -309,6 +323,13 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
                 conn_fd = -1;
                 pfds[1].fd = -1;
                 fprintf(stderr, "[net] rank=%d connect right OK\n", rank);
+                // Optional: report peer endpoint
+                struct sockaddr_in peer; socklen_t prl = sizeof peer;
+                if (getpeername(right_fd, (struct sockaddr*)&peer, &prl) == 0) {
+                    char ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+                    fprintf(stderr, "[net] rank=%d connected to right %s:%u\n", rank, ip, ntohs(peer.sin_port));
+                }
             }
         }
     }
@@ -403,11 +424,12 @@ int pgnet_ring_connect(struct pg *pg) {
     int timeout_ms = getenv_int("PG_CONNECT_TIMEOUT_MS", PG_DEFAULT_CONNECT_TIMEOUT_MS);
     int backoff_ms = getenv_int("PG_BACKOFF_MS", PG_DEFAULT_BACKOFF_MS);
 
-    // Per-rank ports
+    // Per-rank ports (consistent modulo scheme for all ranks)
     int listen_port = base_port + (pg->rank % 10000);
-    int right_port  = base_port + ((pg->rank + 1) % pg->world);
+    int right_rank  = (pg->rank + 1) % pg->world;
+    int right_port  = base_port + (right_rank % 10000);
     int left_rank   = (pg->rank - 1 + pg->world) % pg->world;
-    int left_port   = base_port + left_rank; (void)left_port; // for clarity/logs if needed
+    int left_port   = base_port + (left_rank % 10000); (void)left_port; // for clarity/logs if needed
     const char *right_host = pg->hosts[right];
 
     fprintf(stderr, "[net] rank=%d listening on port %d, connecting right=%s:%d\n",

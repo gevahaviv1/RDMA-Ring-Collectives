@@ -382,6 +382,10 @@ int pgnet_ring_connect(struct pg *pg) {
     int right_port  = base_port + ((pg->rank + 1) % pg->world);
     int left_rank   = (pg->rank - 1 + pg->world) % pg->world;
     int left_port   = base_port + left_rank; (void)left_port; // for clarity/logs if needed
+    const char *right_host = pg->hosts[right];
+
+    fprintf(stderr, "[net] rank=%d listening on port %d, connecting right=%s:%d\n",
+            pg->rank, listen_port, right_host, right_port);
 
 #ifdef PG_DEBUG
     fprintf(stderr, "[net] rank=%d listen=%s:%d right=%s:%d timeout=%dms\n",

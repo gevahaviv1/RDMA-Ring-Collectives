@@ -25,6 +25,38 @@
  */
 
 //==============================================================================
+// Bootstrap Pack Helpers
+//==============================================================================
+
+// Pack the blob we send to our RIGHT neighbor: it must contain the QP the
+// RIGHT neighbor will target (our local QP that talks to RIGHT neighbor).
+static void pack_boot_for_right(struct pg *pg, const union ibv_gid *gid,
+                                uint16_t lid, uint32_t psn, struct qp_boot *b) {
+    memset(b, 0, sizeof(*b));
+    b->qpn   = pg->qp_right->qp_num;      // QP our RIGHT neighbor must target
+    b->psn   = psn;
+    b->lid   = lid;
+    memcpy(b->gid, gid, 16);
+    b->addr  = (uintptr_t)pg->mr->addr;
+    b->rkey  = pg->mr->rkey;
+    b->bytes = pg->mr->length;
+}
+
+// Pack the blob we send to our LEFT neighbor: it must contain the QP the
+// LEFT neighbor will target (our local QP that talks to LEFT neighbor).
+static void pack_boot_for_left(struct pg *pg, const union ibv_gid *gid,
+                               uint16_t lid, uint32_t psn, struct qp_boot *b) {
+    memset(b, 0, sizeof(*b));
+    b->qpn   = pg->qp_left->qp_num;       // QP our LEFT neighbor must target
+    b->psn   = psn;
+    b->lid   = lid;
+    memcpy(b->gid, gid, 16);
+    b->addr  = (uintptr_t)pg->mr->addr;
+    b->rkey  = pg->mr->rkey;
+    b->bytes = pg->mr->length;
+}
+
+//==============================================================================
 // Socket I/O Helpers
 //==============================================================================
 
@@ -453,23 +485,9 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         return -1;
     }
 
-    // 2. Populate local bootstrap info for each neighbor/direction.
-    struct qp_boot my_left;  // info for our QP that talks to LEFT neighbor
-    struct qp_boot my_right; // info for our QP that talks to RIGHT neighbor
-    memset(&my_left, 0, sizeof(my_left));
-    memset(&my_right, 0, sizeof(my_right));
-
-    // Common fields
-    memcpy(my_left.gid, &local_gid, 16);
-    memcpy(my_right.gid, &local_gid, 16);
-    my_left.lid = my_right.lid = port_attr.lid;
-    my_left.addr = my_right.addr = (uintptr_t)pg->mr->addr;
-    my_left.rkey = my_right.rkey = pg->mr->rkey;
-    my_left.bytes = my_right.bytes = pg->mr->length;
-
-    // Direction-specific fields
-    my_left.qpn  = pg->qp_left->qp_num;
-    my_right.qpn = pg->qp_right->qp_num;
+    // 2. Populate local bootstrap info for each neighbor/direction using helpers.
+    struct qp_boot my_left;   // blob to send to LEFT neighbor (targets our qp_left)
+    struct qp_boot my_right;  // blob to send to RIGHT neighbor (targets our qp_right)
 
     // Generate high-quality, non-zero PSNs using getrandom()
     uint32_t psns[2] = {0};
@@ -481,8 +499,11 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         psns[0] = (uint32_t)lrand48();
         psns[1] = (uint32_t)lrand48();
     }
-    my_left.psn  = (psns[0] & 0xFFFFFF) ?: 1; // ensure not 0
-    my_right.psn = (psns[1] & 0xFFFFFF) ?: 1; // ensure not 0
+    uint32_t psn_left  = (psns[0] & 0xFFFFFF) ?: 1; // ensure not 0
+    uint32_t psn_right = (psns[1] & 0xFFFFFF) ?: 1; // ensure not 0
+
+    pack_boot_for_left(pg,  &local_gid, port_attr.lid, psn_left,  &my_left);
+    pack_boot_for_right(pg, &local_gid, port_attr.lid, psn_right, &my_right);
 
     // 3. Exchange bootstrap info with neighbors.
     // Classic ring-safe ordering:
@@ -490,22 +511,30 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     //   - others: recv-first from left, then send-first to right
     if (pg->rank == 0) {
         fprintf(stderr, "[boot] (rank0) exch with right (send-first): send qp_right=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with right: sending my R=%u, expecting peer_left\n",
+                pg->rank, pg->qp_right->qp_num);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
         }
         fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send qp_left=%u psn=%u\n", my_left.qpn, my_left.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my L=%u, expecting peer_right\n",
+                pg->rank, pg->qp_left->qp_num);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
     } else {
         fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send qp_left=%u psn=%u\n", my_left.qpn, my_left.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my L=%u, expecting peer_right\n",
+                pg->rank, pg->qp_left->qp_num);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
         fprintf(stderr, "[boot] exch with right (send-first): send qp_right=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with right: sending my R=%u, expecting peer_left\n",
+                pg->rank, pg->qp_right->qp_num);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
@@ -530,7 +559,13 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     fprintf(stderr, "\n");
     // 4. Transition local QPs to RTR and RTS using received remote info.
     enum ibv_mtu mtu = IBV_MTU_1024;
+    int use_gid = (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET);
+    // Show LID/GID path used for each direction (helps diagnose fabric issues)
+    fprintf(stderr, "[rtr] rank=%d using %s to remote qpn=%u lid=%u (LEFT dir)\n",
+            pg->rank, use_gid ? "GRH" : "LID", (unsigned)pg->left_qp.qpn, (unsigned)pg->left_qp.lid);
     if (rdma_qp_to_rtr(pg->qp_left, &pg->left_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
+    fprintf(stderr, "[rtr] rank=%d using %s to remote qpn=%u lid=%u (RIGHT dir)\n",
+            pg->rank, use_gid ? "GRH" : "LID", (unsigned)pg->right_qp.qpn, (unsigned)pg->right_qp.lid);
     if (rdma_qp_to_rtr(pg->qp_right, &pg->right_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
     if (rdma_qp_to_rts(pg->qp_left, my_left.psn) != 0) return -1;
     if (rdma_qp_to_rts(pg->qp_right, my_right.psn) != 0) return -1;
@@ -542,6 +577,29 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
             pg->qp_left->qp_num, pg->qp_right->qp_num,
             (unsigned)pg->left_qp.qpn, (unsigned)pg->left_qp.lid, (unsigned)pg->left_qp.psn,
             (unsigned)pg->right_qp.qpn, (unsigned)pg->right_qp.lid, (unsigned)pg->right_qp.psn);
+
+#ifdef PG_DEBUG
+    // Cross-rank mapping invariants (compact):
+    // - Our left QP pairs with LEFT neighbor's RIGHT QP (stored in left_blob)
+    // - Our right QP pairs with RIGHT neighbor's LEFT QP (stored in right_blob)
+    fprintf(stderr,
+            "[map] rank=%d local{L=%u R=%u} expect{L<-left.right: qpn=%u, R<-right.left: qpn=%u}\n",
+            pg->rank,
+            pg->qp_left->qp_num, pg->qp_right->qp_num,
+            (unsigned)pg->left_qp.qpn,   // left neighbor's RIGHT qpn
+            (unsigned)pg->right_qp.qpn); // right neighbor's LEFT qpn
+
+    // Sanity orientation at RTR time (no swap):
+    //   setup_rtr(qp_left,  left_blob)
+    //   setup_rtr(qp_right, right_blob)
+    fprintf(stderr,
+            "[map] rank=%d RTR mapping: qp_left<=left_blob.qpn=%u, qp_right<=right_blob.qpn=%u\n",
+            pg->rank, (unsigned)pg->left_qp.qpn, (unsigned)pg->right_qp.qpn);
+
+    // These comments describe the ring invariants you can eyeball across hosts:
+    // rank k: right_blob.qpn must equal rank (k+1): qp_left->qp_num
+    // rank k: left_blob.qpn  must equal rank (k-1): qp_right->qp_num
+#endif
 
     // 5. Query and store the actual max inline data size supported.
     if (rdma_qp_query_inline(pg->qp_left, &pg->max_inline_data) != 0) {

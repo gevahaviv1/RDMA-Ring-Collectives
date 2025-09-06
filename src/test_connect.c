@@ -227,8 +227,9 @@ int main(int argc, char *argv[]) {
       break;
     } else if (n > 0) {
       if (wc.status != IBV_WC_SUCCESS) {
-        fprintf(stderr, "Work completion error: %s\n",
-                ibv_wc_status_str(wc.status));
+        fprintf(stderr,
+                "WC error on qp=%u: status=%d (%s) vendor_err=0x%x\n",
+                wc.qp_num, wc.status, ibv_wc_status_str(wc.status), wc.vendor_err);
         return EXIT_FAILURE;
       }
       fprintf(stderr, "CQE: wr_id=%llu opcode=%u\n", (unsigned long long)wc.wr_id, wc.opcode);

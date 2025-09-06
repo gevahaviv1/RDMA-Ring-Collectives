@@ -1,11 +1,24 @@
 #include "RDMA_api.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 /*
  * Implementation of the low-level RDMA helper functions declared in RDMA_api.h.
  * These functions provide a simplified interface to the InfiniBand verbs API.
  */
+
+//==============================================================================
+// Helper: Get environment variable as int, clamped to [min, max]
+//==============================================================================
+static int getenv_int_clamped(const char *name, int default_val, int min_val, int max_val) {
+    const char *s = getenv(name);
+    if (!s || !*s) return default_val;
+    int val = atoi(s);
+    if (val < min_val) val = min_val;
+    if (val > max_val) val = max_val;
+    return val;
+}
 
 //==============================================================================
 // RDMA Resource Management

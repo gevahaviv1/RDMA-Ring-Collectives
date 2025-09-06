@@ -512,6 +512,13 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         }
     }
 
+    // Neighbor blob debug after TCP exchange
+    fprintf(stderr,
+            "[nbr] rank=%d left_blob{qpn=%u lid=%u psn=%u} right_blob{qpn=%u lid=%u psn=%u}\n",
+            pg->rank,
+            pg->left_qp.qpn, (unsigned)pg->left_qp.lid, pg->left_qp.psn,
+            pg->right_qp.qpn, (unsigned)pg->right_qp.lid, pg->right_qp.psn);
+
     // 4. Dump received remote info for diagnostics, then transition to RTR/RTS.
     fprintf(stderr, "[boot] rx left:  qpn=%u psn=%u rkey=%u bytes=%u gid=",
             pg->left_qp.qpn, pg->left_qp.psn, pg->left_qp.rkey, pg->left_qp.bytes);
@@ -527,6 +534,14 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     if (rdma_qp_to_rtr(pg->qp_right, &pg->right_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
     if (rdma_qp_to_rts(pg->qp_left, my_left.psn) != 0) return -1;
     if (rdma_qp_to_rts(pg->qp_right, my_right.psn) != 0) return -1;
+
+    // Mapping debug after QPs reach RTS
+    fprintf(stderr,
+            "[map] rank=%d local_qps{L=%u R=%u} remote_used{for_left: qpn=%u lid=%u psn=%u, for_right: qpn=%u lid=%u psn=%u}\n",
+            pg->rank,
+            pg->qp_left->qp_num, pg->qp_right->qp_num,
+            (unsigned)pg->left_qp.qpn, (unsigned)pg->left_qp.lid, (unsigned)pg->left_qp.psn,
+            (unsigned)pg->right_qp.qpn, (unsigned)pg->right_qp.lid, (unsigned)pg->right_qp.psn);
 
     // 5. Query and store the actual max inline data size supported.
     if (rdma_qp_query_inline(pg->qp_left, &pg->max_inline_data) != 0) {

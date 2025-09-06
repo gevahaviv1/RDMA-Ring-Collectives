@@ -65,8 +65,46 @@ static int post_one_recv(struct ibv_qp *qp, struct ibv_mr *mr, int *buf) {
     return ret;
 }
 
+// Helper to stringify QP state for clearer debug logs
+static const char *qp_state_str(enum ibv_qp_state s) {
+    switch (s) {
+        case IBV_QPS_RESET: return "RESET";
+        case IBV_QPS_INIT:  return "INIT";
+        case IBV_QPS_RTR:   return "RTR";
+        case IBV_QPS_RTS:   return "RTS";
+        case IBV_QPS_SQD:   return "SQD";
+        case IBV_QPS_SQE:   return "SQE";
+        case IBV_QPS_ERR:   return "ERR";
+        default: return "?";
+    }
+}
+
+static void debug_dump_qp(struct ibv_qp *qp, const char *name) {
+    struct ibv_qp_attr attr;
+    struct ibv_qp_init_attr init;
+    memset(&attr, 0, sizeof(attr));
+    memset(&init, 0, sizeof(init));
+    int mask = IBV_QP_STATE | IBV_QP_CAP;
+    if (ibv_query_qp(qp, &attr, mask, &init) == 0) {
+        fprintf(stderr, "QP %s: qpn=%u state=%s max_inline=%u max_send_wr=%u max_recv_wr=%u\n",
+                name, qp->qp_num, qp_state_str(attr.qp_state),
+                init.cap.max_inline_data, init.cap.max_send_wr, init.cap.max_recv_wr);
+    } else {
+        perror("ibv_query_qp");
+    }
+}
+
 static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
                          uint32_t send_flags) {
+    // Sanity-check the buffer is within the MR range
+    uintptr_t a = (uintptr_t)buf;
+    uintptr_t start = (uintptr_t)mr->addr;
+    uintptr_t end = start + mr->length;
+    if (a < start || (a + sizeof(int)) > end) {
+        fprintf(stderr, "SEND buffer %p out of MR range [%p..%p)\n",
+                (void*)a, (void*)start, (void*)end);
+        return EINVAL;
+    }
     struct ibv_sge sge = {
         .addr = (uintptr_t)buf, .length = sizeof(int), .lkey = mr->lkey};
     struct ibv_send_wr wr = {.wr_id = 2,
@@ -75,7 +113,16 @@ static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
                              .opcode = IBV_WR_SEND,
                              .send_flags = send_flags};
     struct ibv_send_wr *bad;
-    fprintf(stderr, "Posting send for buf at %p...\n", buf);
+    // Optional: allow disabling inline via env for troubleshooting
+    const char *no_inline = getenv("PG_NO_INLINE");
+    if (no_inline && no_inline[0] == '1') {
+        send_flags &= ~IBV_SEND_INLINE;
+    }
+
+    fprintf(stderr, "Posting send for buf at %p (len=%zu) lkey=0x%x flags=0x%x...\n",
+            buf, sizeof(int), mr->lkey, send_flags);
+    debug_dump_qp(qp, "send_qp");
+    fflush(stderr);
     int ret = ibv_post_send(qp, &wr, &bad);
     if (ret) {
         fprintf(stderr, "Failed to post SEND: %s\n", strerror(ret));

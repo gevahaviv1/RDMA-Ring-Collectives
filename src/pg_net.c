@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <inttypes.h>
 
 #include "pg_internal.h"
 #include "RDMA_api.h"
@@ -70,6 +71,34 @@ static int pgnet_read_full(int fd, void *buf, size_t len) {
         len -= (size_t)n;
     }
     return 0;
+}
+
+//==============================================================================
+// GID Debug Helpers
+//==============================================================================
+
+static void print_gid_hex(const uint8_t gid[16]) {
+    fprintf(stderr,
+            "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+            gid[0], gid[1], gid[2], gid[3], gid[4], gid[5], gid[6], gid[7],
+            gid[8], gid[9], gid[10], gid[11], gid[12], gid[13], gid[14], gid[15]);
+}
+
+static void dump_port_and_gids(struct ibv_context *ctx, uint8_t port, int limit) {
+    struct ibv_port_attr pa; memset(&pa, 0, sizeof(pa));
+    if (ibv_query_port(ctx, port, &pa) == 0) {
+        fprintf(stderr, "[rdma] port %u link_layer=%s active_mtu=%u lid=%u\n",
+                (unsigned)port,
+                (pa.link_layer == IBV_LINK_LAYER_ETHERNET ? "ETHERNET" : "INFINIBAND"),
+                (unsigned)pa.active_mtu, (unsigned)pa.lid);
+    }
+    union ibv_gid g; memset(&g, 0, sizeof(g));
+    for (int i = 0; i < limit; ++i) {
+        if (ibv_query_gid(ctx, port, (uint8_t)i, &g) != 0) break;
+        fprintf(stderr, "[rdma] gid[%d]=", i);
+        print_gid_hex(g.raw);
+        fprintf(stderr, "\n");
+    }
 }
 
 //==============================================================================
@@ -376,6 +405,9 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     if (rdma_query_gid(pg->ctx, pg->ib_port, pg->gid_index, &local_gid) != 0) {
         return -1;
     }
+    fprintf(stderr, "[boot] using gid_index=%u local_gid=", (unsigned)pg->gid_index);
+    print_gid_hex(local_gid.raw);
+    fprintf(stderr, "\n");
     struct ibv_port_attr port_attr;
     memset(&port_attr, 0, sizeof(port_attr));
     if (ibv_query_port(pg->ctx, pg->ib_port, &port_attr) != 0) {
@@ -443,10 +475,14 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     }
 
     // 4. Dump received remote info for diagnostics, then transition to RTR/RTS.
-    fprintf(stderr, "[boot] rx left:  qpn=%u psn=%u rkey=%u bytes=%u gid0=%02x\n",
-            pg->left_qp.qpn, pg->left_qp.psn, pg->left_qp.rkey, pg->left_qp.bytes, pg->left_qp.gid[0]);
-    fprintf(stderr, "[boot] rx right: qpn=%u psn=%u rkey=%u bytes=%u gid0=%02x\n",
-            pg->right_qp.qpn, pg->right_qp.psn, pg->right_qp.rkey, pg->right_qp.bytes, pg->right_qp.gid[0]);
+    fprintf(stderr, "[boot] rx left:  qpn=%u psn=%u rkey=%u bytes=%u gid=",
+            pg->left_qp.qpn, pg->left_qp.psn, pg->left_qp.rkey, pg->left_qp.bytes);
+    print_gid_hex(pg->left_qp.gid);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[boot] rx right: qpn=%u psn=%u rkey=%u bytes=%u gid=",
+            pg->right_qp.qpn, pg->right_qp.psn, pg->right_qp.rkey, pg->right_qp.bytes);
+    print_gid_hex(pg->right_qp.gid);
+    fprintf(stderr, "\n");
     // 4. Transition local QPs to RTR and RTS using received remote info.
     enum ibv_mtu mtu = IBV_MTU_1024;
     if (rdma_qp_to_rtr(pg->qp_left, &pg->left_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
@@ -478,6 +514,9 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
         if (n != 1) { perror("send ready->right"); return -1; }
         fprintf(stderr, "[boot] ready handshake OK (left then right)\n");
     }
+
+    // Optional debug: dump several GIDs to help troubleshoot addressing issues
+    dump_port_and_gids(pg->ctx, pg->ib_port, 8);
 
     return 0;
 }

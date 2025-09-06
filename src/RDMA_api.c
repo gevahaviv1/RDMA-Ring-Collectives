@@ -239,9 +239,22 @@ int rdma_qp_to_rts(struct ibv_qp *qp, uint32_t local_psn) {
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
-    attr.timeout = 14;      // A common default
-    attr.retry_cnt = 7;     // Max retry count
-    attr.rnr_retry = 7;     // Infinite retry for RNR NACKs
+    // Allow tuning via environment variables for easier debugging
+    const char *s_timeout = getenv("PG_IB_TIMEOUT");
+    const char *s_retry   = getenv("PG_RETRY_CNT");
+    const char *s_rnr     = getenv("PG_RNR_RETRY");
+    int timeout = s_timeout ? atoi(s_timeout) : 14; // 4.096us * 2^timeout
+    int retry   = s_retry   ? atoi(s_retry)   : 7;  // 0..7 where 7 means max
+    int rnr     = s_rnr     ? atoi(s_rnr)     : 7;  // 0..7 where 7 means infinite
+    if (timeout < 0) timeout = 0;
+    if (timeout > 31) timeout = 31;
+    if (retry   < 0) retry   = 0;
+    if (retry   > 7) retry   = 7;
+    if (rnr     < 0) rnr     = 0;
+    if (rnr     > 7) rnr     = 7;
+    attr.timeout = (uint8_t)timeout;
+    attr.retry_cnt = (uint8_t)retry;
+    attr.rnr_retry = (uint8_t)rnr;
     attr.sq_psn = local_psn;
     attr.max_rd_atomic = 1;
 

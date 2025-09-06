@@ -219,6 +219,7 @@ int main(int argc, char *argv[]) {
 
   // Poll CQ until both complete
   int completions = 0;
+  int spins = 0;
   while (completions < 2) {
     struct ibv_wc wc;
     int n = ibv_poll_cq(handle->cq, 1, &wc);
@@ -242,6 +243,15 @@ int main(int argc, char *argv[]) {
         posted_send = 1;
       }
       completions++;
+      spins = 0;
+    } else {
+      // Periodic debug heartbeat to show we are still polling
+      if ((++spins % 1000000) == 0) { // print occasionally
+        fprintf(stderr, "Still waiting for completions (have=%d)...\n", completions);
+        debug_dump_qp(handle->qp_left,  "left_qp");
+        debug_dump_qp(handle->qp_right, "right_qp");
+        fflush(stderr);
+      }
     }
   }
 

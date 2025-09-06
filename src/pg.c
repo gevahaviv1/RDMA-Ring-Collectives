@@ -231,6 +231,16 @@ int connect_process_group(const char *serverlist, void **out_handle) {
     if (rdma_qp_to_init(pg->qp_left, pg->ib_port, 1) != 0) goto fail;
     if (rdma_qp_to_init(pg->qp_right, pg->ib_port, 1) != 0) goto fail;
 
+    // Generate local 24-bit PSNs once, before TCP exchange and QP transitions to RTR/RTS
+    {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        long seed = (long)ts.tv_nsec ^ (long)ts.tv_sec ^ (long)getpid() ^ (long)pg->rank;
+        srand48(seed);
+        pg->psn_left  = (uint32_t)(lrand48() & 0xFFFFFFu);
+        pg->psn_right = (uint32_t)(lrand48() & 0xFFFFFFu);
+        fprintf(stderr, "[psn] rank=%d L=%u R=%u\n", pg->rank, pg->psn_left, pg->psn_right);
+    }
+
     // Establish network connections and exchange bootstrap info
     if (pg->world_size > 1) {
         if (pgnet_ring_connect(pg) != 0) goto fail;

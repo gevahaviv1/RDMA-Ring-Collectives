@@ -64,12 +64,16 @@ static void pack_boot_for_right(struct pg *pg, const union ibv_gid *gid,
     memset(b, 0, sizeof(*b));
     // Export our RIGHT-facing QP so RIGHT neighbor can program its qp_left
     b->qpn   = pg->qp_right->qp_num;
-    b->psn   = psn;
+    // PSN must match what RTS will use for qp_right
+    (void)psn; // ignore and use stored handle PSN to avoid drift
+    b->psn   = (pg->psn_right & 0xFFFFFFu);
     b->lid   = lid;
     memcpy(b->gid, gid, 16);
     b->addr  = (uintptr_t)pg->mr->addr;
     b->rkey  = pg->mr->rkey;
     b->bytes = pg->mr->length;
+    fprintf(stderr, "[boot-pack] rank=%d send-%s qpn=%u psn=%u\n",
+            pg->rank, "R", b->qpn, b->psn);
 }
 
 // Pack the blob we send to our LEFT neighbor: it must contain the QP the
@@ -79,12 +83,16 @@ static void pack_boot_for_left(struct pg *pg, const union ibv_gid *gid,
     memset(b, 0, sizeof(*b));
     // Export our LEFT-facing QP so LEFT neighbor can program its qp_right
     b->qpn   = pg->qp_left->qp_num;
-    b->psn   = psn;
+    // PSN must match what RTS will use for qp_left
+    (void)psn; // ignore and use stored handle PSN to avoid drift
+    b->psn   = (pg->psn_left & 0xFFFFFFu);
     b->lid   = lid;
     memcpy(b->gid, gid, 16);
     b->addr  = (uintptr_t)pg->mr->addr;
     b->rkey  = pg->mr->rkey;
     b->bytes = pg->mr->length;
+    fprintf(stderr, "[boot-pack] rank=%d send-%s qpn=%u psn=%u\n",
+            pg->rank, "L", b->qpn, b->psn);
 }
 
 //==============================================================================
@@ -554,18 +562,9 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     struct qp_boot my_left;   // blob to send to LEFT neighbor (targets our qp_left)
     struct qp_boot my_right;  // blob to send to RIGHT neighbor (targets our qp_right)
 
-    // Generate high-quality, non-zero PSNs using getrandom()
-    uint32_t psns[2] = {0};
-    if (getrandom(psns, sizeof(psns), 0) != sizeof(psns)) {
-        // Fallback for environments without getrandom (less ideal)
-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-        long seed = (long)ts.tv_nsec ^ (long)ts.tv_sec ^ (long)getpid() ^ (long)pg->rank;
-        srand48(seed);
-        psns[0] = (uint32_t)lrand48();
-        psns[1] = (uint32_t)lrand48();
-    }
-    uint32_t psn_left  = (psns[0] & 0xFFFFFF) ?: 1; // ensure not 0
-    uint32_t psn_right = (psns[1] & 0xFFFFFF) ?: 1; // ensure not 0
+    // Use pre-generated local PSNs from the handle (24-bit)
+    uint32_t psn_left  = (pg->psn_left  & 0xFFFFFFu) ?: 1;
+    uint32_t psn_right = (pg->psn_right & 0xFFFFFFu) ?: 1;
 
     // Ensure PSN in each blob matches the exported local QP
     pack_boot_for_left(pg,  &local_gid, port_attr.lid, psn_left,  &my_left);  // exports qp_left
@@ -634,11 +633,27 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     fprintf(stderr, "[rtr] rank=%d using %s to remote qpn=%u lid=%u (LEFT dir)\n",
             pg->rank, use_gid ? "GRH" : "LID", (unsigned)pg->left_qp.qpn, (unsigned)pg->left_qp.lid);
     if (rdma_qp_to_rtr(pg->qp_left, &pg->left_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
+    fprintf(stderr, "[psn-prog] rank=%d qpn=%u RTR.rq_psn=%u RTS.sq_psn=%u\n",
+            pg->rank, pg->qp_left->qp_num, (unsigned)pg->left_qp.psn, (unsigned)pg->psn_left);
     fprintf(stderr, "[rtr] rank=%d using %s to remote qpn=%u lid=%u (RIGHT dir)\n",
             pg->rank, use_gid ? "GRH" : "LID", (unsigned)pg->right_qp.qpn, (unsigned)pg->right_qp.lid);
     if (rdma_qp_to_rtr(pg->qp_right, &pg->right_qp, pg->ib_port, pg->gid_index, mtu) != 0) return -1;
+    fprintf(stderr, "[psn-prog] rank=%d qpn=%u RTR.rq_psn=%u RTS.sq_psn=%u\n",
+            pg->rank, pg->qp_right->qp_num, (unsigned)pg->right_qp.psn, (unsigned)pg->psn_right);
     if (rdma_qp_to_rts(pg->qp_left, my_left.psn) != 0) return -1;
     if (rdma_qp_to_rts(pg->qp_right, my_right.psn) != 0) return -1;
+
+    // Sanity-check: what we advertised equals what we programmed
+    if ((my_right.psn & 0xFFFFFFu) != (pg->psn_right & 0xFFFFFFu)) {
+        fprintf(stderr,
+                "[psn-mismatch] rank=%d right: advertised=%u programmed=%u\n",
+                pg->rank, (unsigned)(my_right.psn & 0xFFFFFFu), (unsigned)(pg->psn_right & 0xFFFFFFu));
+    }
+    if ((my_left.psn & 0xFFFFFFu) != (pg->psn_left & 0xFFFFFFu)) {
+        fprintf(stderr,
+                "[psn-mismatch] rank=%d left:  advertised=%u programmed=%u\n",
+                pg->rank, (unsigned)(my_left.psn & 0xFFFFFFu), (unsigned)(pg->psn_left & 0xFFFFFFu));
+    }
 
     // Mapping debug after QPs reach RTS
     fprintf(stderr,

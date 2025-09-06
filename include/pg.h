@@ -68,6 +68,10 @@ struct pg {
 
   //-- Capabilities --//
   uint32_t max_inline_data; /**< Max inline data size supported by the QP. */
+
+  //-- PSNs (local sequence numbers) --//
+  uint32_t psn_left;   /**< 24-bit PSN used for qp_left (local). */
+  uint32_t psn_right;  /**< 24-bit PSN used for qp_right (local). */
 };
 
 /** @brief Supported element datatypes for collective operations. */

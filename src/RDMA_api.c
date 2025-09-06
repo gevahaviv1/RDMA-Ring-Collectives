@@ -213,31 +213,26 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
         memcpy(&attr.ah_attr.grh.dgid, remote->gid, 16);
         attr.ah_attr.grh.sgid_index = sgid_index;
         attr.ah_attr.grh.hop_limit = 64;
+        attr.ah_attr.grh.traffic_class = 0;
+        attr.ah_attr.grh.flow_label = 0;
         attr.ah_attr.dlid = 0; // not used on RoCE
-        fprintf(stderr, "[rdma] to RTR: RoCE remote qpn=%u rq_psn=%u mtu=%d gid[0]=%02x\n",
-                remote->qpn, remote->psn, (int)mtu, remote->gid[0]);
+        fprintf(stderr, "[rdma] to RTR: RoCE remote qpn=%u rq_psn=%u mtu=%d gid[0]=%02x sgid_idx=%u\n",
+                remote->qpn, remote->psn, (int)mtu, remote->gid[0], (unsigned)sgid_index);
     } else {
         // InfiniBand: address by LID; no GRH
         attr.ah_attr.is_global = 0;
         attr.ah_attr.dlid = remote->lid;
 
-        // Optional tuning from environment
-        const char *s_sl = getenv("PG_SL");
-        if (s_sl && *s_sl) {
-            int v = atoi(s_sl);
-            if (v < 0) v = 0; if (v > 15) v = 15;
-            attr.ah_attr.sl = (uint8_t)v;
-        }
-        const char *s_spb = getenv("PG_SRC_PATH_BITS");
-        if (s_spb && *s_spb) {
-            int v = atoi(s_spb);
-            if (v < 0) v = 0; if (v > 7) v = 7;
-            attr.ah_attr.src_path_bits = (uint8_t)v;
-        }
+        // Tuning from environment with clamping and LMC awareness
+        int sl  = getenv_int_clamped("PG_SL", 0, 0, 15);
+        int spb = getenv_int_clamped("PG_SRC_PATH_BITS", 0, 0, 7);
+        int max_bits = (1 << port_attr.lmc);
+        if (spb >= max_bits) spb = 0;
+        attr.ah_attr.sl = (uint8_t)sl;
+        attr.ah_attr.src_path_bits = (uint8_t)spb;
 
-        fprintf(stderr, "[rdma] to RTR: IB remote qpn=%u rq_psn=%u mtu=%d lid=%u sl=%u spb=%u\n",
-                remote->qpn, remote->psn, (int)mtu, (unsigned)remote->lid,
-                (unsigned)attr.ah_attr.sl, (unsigned)attr.ah_attr.src_path_bits);
+        fprintf(stderr, "[rdma] to RTR: IB remote qpn=%u rq_psn=%u mtu=%d lid=%u sl=%d spb=%d\n",
+                remote->qpn, remote->psn, (int)mtu, (unsigned)remote->lid, sl, spb);
     }
 
     if (ibv_modify_qp(qp, &attr, mask)) {

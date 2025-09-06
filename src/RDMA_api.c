@@ -227,6 +227,14 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
         fprintf(stderr, "Failed to transition QP to RTR state\n");
         return -1;
     }
+    // Query and log effective RTR attributes
+    struct ibv_qp_attr qattr; memset(&qattr, 0, sizeof(qattr));
+    struct ibv_qp_init_attr iattr; memset(&iattr, 0, sizeof(iattr));
+    int qmask = IBV_QP_AV | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_PATH_MTU;
+    if (ibv_query_qp(qp, &qattr, qmask, &iattr) == 0) {
+        fprintf(stderr, "[qry-RTR] qpn=%u dest_qpn=%u dlid=%u port=%u rq_psn=%u\n",
+                qp->qp_num, qattr.dest_qp_num, qattr.ah_attr.dlid, qattr.ah_attr.port_num, qattr.rq_psn);
+    }
     return 0;
 }
 
@@ -263,6 +271,14 @@ int rdma_qp_to_rts(struct ibv_qp *qp, uint32_t local_psn) {
     if (ibv_modify_qp(qp, &attr, mask)) {
         fprintf(stderr, "Failed to transition QP to RTS state\n");
         return -1;
+    }
+    // Query and log effective RTS attributes
+    struct ibv_qp_attr qattr; memset(&qattr, 0, sizeof(qattr));
+    struct ibv_qp_init_attr iattr; memset(&iattr, 0, sizeof(iattr));
+    int qmask = IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
+    if (ibv_query_qp(qp, &qattr, qmask, &iattr) == 0) {
+        fprintf(stderr, "[qry-RTS] qpn=%u sq_psn=%u timeout=%u retry=%u rnr=%u\n",
+                qp->qp_num, qattr.sq_psn, qattr.timeout, qattr.retry_cnt, qattr.rnr_retry);
     }
     return 0;
 }

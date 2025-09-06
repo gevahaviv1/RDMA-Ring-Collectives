@@ -143,7 +143,7 @@ int main(int argc, char *argv[]) {
 
   int myindex = -1;
   char hostlist[1024] = {0};
-  int chain_mode = 0; // optional serialized hop-by-hop mode
+  int chain_mode = 1; // default to serialized hop-by-hop relay mode
 
   // --- parse args ---
   for (int i = 1; i < argc; i++) {
@@ -155,8 +155,6 @@ int main(int argc, char *argv[]) {
         if (j < argc - 1) strcat(hostlist, " ");
       }
       break;
-    } else if (strcmp(argv[i], "--chain") == 0 || strcmp(argv[i], "-chain") == 0) {
-      chain_mode = 1;
     }
   }
 
@@ -195,26 +193,19 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Synchronize all ranks to ensure RECVs are posted before any SEND
-  if (tcp_barrier(handle) != 0) {
-      fprintf(stderr, "TCP barrier failed\n");
-      return EXIT_FAILURE;
-  }
-
-  // In CHAIN mode, only rank 0 sends initially. Others wait until their RECV completes.
-  // In default mode, everyone posts SEND immediately after the barrier.
+  // One-at-a-time relay: everyone posts RECV; only rank 0 sends first.
   uint32_t flags = IBV_SEND_SIGNALED;
   if (handle->max_inline_data >= sizeof(int)) flags |= IBV_SEND_INLINE;
   int posted_send = 0;
-  if (!chain_mode || handle->rank == 0) {
-    fprintf(stderr, "Rank %d posting send to right%s...\n", myindex, chain_mode ? " [CHAIN start]" : "");
+  if (handle->rank == 0) {
+    fprintf(stderr, "Rank %d posting send to right [RELAY start]...\n", myindex);
     if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
       fprintf(stderr, "Failed to post SEND\n");
       return EXIT_FAILURE;
     }
     posted_send = 1;
   } else {
-    fprintf(stderr, "Rank %d defers SEND until RECV completes [CHAIN]...\n", myindex);
+    fprintf(stderr, "Rank %d defers SEND until RECV completes [RELAY]...\n", myindex);
   }
 
   // Poll CQ until both complete
@@ -233,9 +224,9 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
       }
       fprintf(stderr, "CQE: wr_id=%llu opcode=%u\n", (unsigned long long)wc.wr_id, wc.opcode);
-      // In CHAIN mode, once our RECV completes, we trigger our SEND if not yet posted.
-      if (chain_mode && wc.wr_id == 1 && !posted_send) {
-        fprintf(stderr, "Rank %d posting send to right [CHAIN after RECV]...\n", myindex);
+      // Relay: once RECV completes, forward by posting SEND to right (if not yet posted)
+      if (wc.wr_id == 1 && !posted_send) {
+        fprintf(stderr, "[relay] rank=%d got RECV, forwarding...\n", myindex);
         if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
           fprintf(stderr, "Failed to post SEND\n");
           return EXIT_FAILURE;

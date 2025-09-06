@@ -119,11 +119,15 @@ static int post_one_send(struct ibv_qp *qp, struct ibv_mr *mr, int *buf,
         send_flags &= ~IBV_SEND_INLINE;
     }
 
+    // Ensure WR reflects any env-based flag changes
+    wr.send_flags = send_flags;
+
     fprintf(stderr, "Posting send for buf at %p (len=%zu) lkey=0x%x flags=0x%x...\n",
             buf, sizeof(int), mr->lkey, send_flags);
     debug_dump_qp(qp, "send_qp");
     fflush(stderr);
     int ret = ibv_post_send(qp, &wr, &bad);
+    fprintf(stderr, "ibv_post_send returned %d%s\n", ret, ret ? " (error)" : "");
     if (ret) {
         fprintf(stderr, "Failed to post SEND: %s\n", strerror(ret));
     }
@@ -205,6 +209,7 @@ int main(int argc, char *argv[]) {
 
   // Poll CQ until both complete
   int completions = 0;
+  int spins = 0;
   while (completions < 2) {
     struct ibv_wc wc;
     int n = ibv_poll_cq(handle->cq, 1, &wc);
@@ -217,7 +222,17 @@ int main(int argc, char *argv[]) {
                 ibv_wc_status_str(wc.status));
         return EXIT_FAILURE;
       }
+      fprintf(stderr, "CQE: wr_id=%llu opcode=%u\n", (unsigned long long)wc.wr_id, wc.opcode);
       completions++;
+      spins = 0;
+    } else {
+      // Periodic debug heartbeat to show we are still polling
+      if ((++spins % 1000000) == 0) { // print occasionally
+        fprintf(stderr, "Still waiting for completions (have=%d)...\n", completions);
+        debug_dump_qp(handle->qp_left,  "left_qp");
+        debug_dump_qp(handle->qp_right, "right_qp");
+        fflush(stderr);
+      }
     }
   }
 

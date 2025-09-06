@@ -143,6 +143,7 @@ int main(int argc, char *argv[]) {
 
   int myindex = -1;
   char hostlist[1024] = {0};
+  int chain_mode = 0; // optional serialized hop-by-hop mode
 
   // --- parse args ---
   for (int i = 1; i < argc; i++) {
@@ -154,6 +155,8 @@ int main(int argc, char *argv[]) {
         if (j < argc - 1) strcat(hostlist, " ");
       }
       break;
+    } else if (strcmp(argv[i], "--chain") == 0 || strcmp(argv[i], "-chain") == 0) {
+      chain_mode = 1;
     }
   }
 
@@ -165,8 +168,8 @@ int main(int argc, char *argv[]) {
   char hostname[256];
   gethostname(hostname, sizeof(hostname));
 
-  printf("Rank %d on host %s starting, hostlist='%s'\n", myindex, hostname,
-         hostlist);
+  printf("Rank %d on host %s starting, hostlist='%s'%s\n", myindex, hostname,
+         hostlist, chain_mode ? " [CHAIN]" : "");
 
   // --- call your existing connect_process_group ---
   struct pg *handle;
@@ -192,24 +195,30 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  // Synchronize all ranks to ensure RECVs are posted before SENDs
+  // Synchronize all ranks to ensure RECVs are posted before any SEND
   if (tcp_barrier(handle) != 0) {
       fprintf(stderr, "TCP barrier failed\n");
       return EXIT_FAILURE;
   }
 
-  // Post SEND to right neighbor using the library's MR
+  // In CHAIN mode, only rank 0 sends initially. Others wait until their RECV completes.
+  // In default mode, everyone posts SEND immediately after the barrier.
   uint32_t flags = IBV_SEND_SIGNALED;
   if (handle->max_inline_data >= sizeof(int)) flags |= IBV_SEND_INLINE;
-  fprintf(stderr, "Rank %d posting send to right...\n", myindex);
-  if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
-    fprintf(stderr, "Failed to post SEND\n");
-    return EXIT_FAILURE;
+  int posted_send = 0;
+  if (!chain_mode || handle->rank == 0) {
+    fprintf(stderr, "Rank %d posting send to right%s...\n", myindex, chain_mode ? " [CHAIN start]" : "");
+    if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
+      fprintf(stderr, "Failed to post SEND\n");
+      return EXIT_FAILURE;
+    }
+    posted_send = 1;
+  } else {
+    fprintf(stderr, "Rank %d defers SEND until RECV completes [CHAIN]...\n", myindex);
   }
 
   // Poll CQ until both complete
   int completions = 0;
-  int spins = 0;
   while (completions < 2) {
     struct ibv_wc wc;
     int n = ibv_poll_cq(handle->cq, 1, &wc);
@@ -223,16 +232,16 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
       }
       fprintf(stderr, "CQE: wr_id=%llu opcode=%u\n", (unsigned long long)wc.wr_id, wc.opcode);
-      completions++;
-      spins = 0;
-    } else {
-      // Periodic debug heartbeat to show we are still polling
-      if ((++spins % 1000000) == 0) { // print occasionally
-        fprintf(stderr, "Still waiting for completions (have=%d)...\n", completions);
-        debug_dump_qp(handle->qp_left,  "left_qp");
-        debug_dump_qp(handle->qp_right, "right_qp");
-        fflush(stderr);
+      // In CHAIN mode, once our RECV completes, we trigger our SEND if not yet posted.
+      if (chain_mode && wc.wr_id == 1 && !posted_send) {
+        fprintf(stderr, "Rank %d posting send to right [CHAIN after RECV]...\n", myindex);
+        if (post_one_send(handle->qp_right, handle->mr, send_buf, flags)) {
+          fprintf(stderr, "Failed to post SEND\n");
+          return EXIT_FAILURE;
+        }
+        posted_send = 1;
       }
+      completions++;
     }
   }
 

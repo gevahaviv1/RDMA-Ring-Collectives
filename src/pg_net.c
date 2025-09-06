@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <endian.h>
 
 #include "pg_internal.h"
 #include "RDMA_api.h"
@@ -27,6 +28,34 @@
 //==============================================================================
 // Bootstrap Pack Helpers
 //==============================================================================
+
+// Fixed, packed wire format (network byte order) for qp_boot exchange
+struct wire_boot {
+    uint32_t qpn;
+    uint32_t psn;
+    uint32_t lid;
+    uint32_t rkey;
+    uint64_t bytes;
+    uint8_t  gid[16];
+} __attribute__((packed));
+
+static void boot_to_wire(const struct qp_boot *in, struct wire_boot *out) {
+    out->qpn   = htonl(in->qpn);
+    out->psn   = htonl(in->psn);
+    out->lid   = htonl(in->lid);
+    out->rkey  = htonl(in->rkey);
+    out->bytes = htobe64(in->bytes);
+    memcpy(out->gid, in->gid, 16);
+}
+
+static void wire_to_boot(const struct wire_boot *in, struct qp_boot *out) {
+    out->qpn   = ntohl(in->qpn);
+    out->psn   = ntohl(in->psn);
+    out->lid   = ntohl(in->lid);
+    out->rkey  = ntohl(in->rkey);
+    out->bytes = be64toh(in->bytes);
+    memcpy(out->gid, in->gid, 16);
+}
 
 // Pack the blob we send to our RIGHT neighbor: it must contain the QP the
 // RIGHT neighbor will target (our local QP that talks to RIGHT neighbor).
@@ -62,47 +91,37 @@ static void pack_boot_for_left(struct pg *pg, const union ibv_gid *gid,
 // Socket I/O Helpers
 //==============================================================================
 
-/**
- * @brief Writes exactly 'len' bytes from 'buf' to socket 'fd'.
- * Handles short writes and EINTR signals to ensure all data is sent.
- * @return 0 on success, -1 on error.
- */
-static int pgnet_write_full(int fd, const void *buf, size_t len) {
-    const char *p = (const char *)buf;
-    while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
-                continue;
-            }
-            fprintf(stderr, "pgnet_write_full failed: %s\n", strerror(errno));
+// Robust, full-length write/read helpers using POSIX write/read.
+static int writen(int fd, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = write(fd, p + off, n - off);
+        if (r > 0) {
+            off += (size_t)r;
+        } else if (r < 0 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        } else {
             return -1;
         }
-        p += n;
-        len -= (size_t)n;
     }
     return 0;
 }
 
-/**
- * @brief Reads exactly 'len' bytes into 'buf' from socket 'fd'.
- * Handles short reads and EINTR signals to ensure all data is received.
- * @return 0 on success, -1 on error or EOF.
- */
-static int pgnet_read_full(int fd, void *buf, size_t len) {
-    char *p = (char *)buf;
-    while (len > 0) {
-        ssize_t n = recv(fd, p, len, 0);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
-                continue;
-            }
-            fprintf(stderr, "pgnet_read_full failed: %s\n",
-                    (n == 0) ? "peer closed connection" : strerror(errno));
+static int readn(int fd, void *buf, size_t n) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, p + off, n - off);
+        if (r > 0) {
+            off += (size_t)r;
+        } else if (r == 0) {
+            return -1; // EOF
+        } else if (errno == EINTR || errno == EAGAIN) {
+            continue;
+        } else {
             return -1;
         }
-        p += n;
-        len -= (size_t)n;
     }
     return 0;
 }
@@ -418,13 +437,39 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
  * @return 0 on success, -1 on failure.
  */
 static int pgnet_exchange_qp(int fd, const struct qp_boot *local, struct qp_boot *remote, int send_first) {
+    struct wire_boot wb_local, wb_remote;
+    boot_to_wire(local, &wb_local);
     if (send_first) {
-        if (pgnet_write_full(fd, local, sizeof(*local)) != 0) return -1;
-        if (pgnet_read_full(fd, remote, sizeof(*remote)) != 0) return -1;
+        if (writen(fd, &wb_local, sizeof(wb_local)) != 0) return -1;
+        if (readn(fd, &wb_remote, sizeof(wb_remote)) != 0) return -1;
+        // One-shot ACK: sender side. Echo our sent qpn and expect peer's qpn back.
+        uint32_t want = local->qpn;
+        uint32_t got = htonl(want);
+        if (writen(fd, &got, sizeof(got)) != 0) return -1;
+        if (readn(fd, &got, sizeof(got)) != 0) return -1;
+        got = ntohl(got);
+        uint32_t peer_qpn = ntohl(wb_remote.qpn);
+        if (got != peer_qpn) {
+            fprintf(stderr, "[boot] ACK mismatch: sent_qpn=%u peer_thinks=%u\n", want, got);
+            return -1;
+        }
+        fprintf(stderr, "[boot] ack ok: sent=%u peer_qpn=%u\n", want, peer_qpn);
     } else {
-        if (pgnet_read_full(fd, remote, sizeof(*remote)) != 0) return -1;
-        if (pgnet_write_full(fd, local, sizeof(*local)) != 0) return -1;
+        if (readn(fd, &wb_remote, sizeof(wb_remote)) != 0) return -1;
+        if (writen(fd, &wb_local, sizeof(wb_local)) != 0) return -1;
+        // One-shot ACK: receiver side. Read sender's qpn and echo back peer's qpn.
+        uint32_t got = 0;
+        uint32_t echo = htonl(ntohl(wb_remote.qpn));
+        if (readn(fd, &got, sizeof(got)) != 0) return -1; // sender's qpn
+        if (writen(fd, &echo, sizeof(echo)) != 0) return -1;
+        got = ntohl(got);
+        if (got != local->qpn) {
+            fprintf(stderr, "[boot] PEER ACK mismatch: peer_sent_qpn=%u my_sent_qpn=%u\n", got, local->qpn);
+            return -1;
+        }
+        fprintf(stderr, "[boot] ack ok: peer_sent=%u my_sent=%u\n", got, local->qpn);
     }
+    wire_to_boot(&wb_remote, remote);
     return 0;
 }
 
@@ -581,6 +626,9 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
             (unsigned)pg->left_qp.qpn, (unsigned)pg->left_qp.lid, (unsigned)pg->left_qp.psn,
             (unsigned)pg->right_qp.qpn, (unsigned)pg->right_qp.lid, (unsigned)pg->right_qp.psn);
 
+    // Cross-rank equality summary (eyeball across ranks):
+    fprintf(stderr, "[eq] expect: right_blob.qpn == next.rank.qp_left; left_blob.qpn == prev.rank.qp_right\n");
+
 #ifdef PG_DEBUG
     // Cross-rank mapping invariants (compact):
     // - Our left QP pairs with LEFT neighbor's RIGHT QP (stored in left_blob)
@@ -612,20 +660,15 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     // 6. Post-RTS ready handshake on TCP to prevent early RDMA sends before peers are ready.
     //    This keeps public API unchanged while adding robustness.
     uint8_t tok = 0xA5, peer = 0;
-    ssize_t n;
     if (pg->rank == 0) {
         // rank0: notify right first, then wait for left
-        n = send(right_fd, &tok, 1, 0);
-        if (n != 1) { perror("send ready->right"); return -1; }
-        n = recv(left_fd, &peer, 1, MSG_WAITALL);
-        if (n != 1) { perror("recv ready<-left"); return -1; }
+        if (writen(right_fd, &tok, 1) != 0) { perror("send ready->right"); return -1; }
+        if (readn(left_fd, &peer, 1) != 0) { perror("recv ready<-left"); return -1; }
         fprintf(stderr, "[boot] (rank0) ready handshake OK (right then left)\n");
     } else {
         // others: wait from left first, then notify right
-        n = recv(left_fd, &peer, 1, MSG_WAITALL);
-        if (n != 1) { perror("recv ready<-left"); return -1; }
-        n = send(right_fd, &tok, 1, 0);
-        if (n != 1) { perror("send ready->right"); return -1; }
+        if (readn(left_fd, &peer, 1) != 0) { perror("recv ready<-left"); return -1; }
+        if (writen(right_fd, &tok, 1) != 0) { perror("send ready->right"); return -1; }
         fprintf(stderr, "[boot] ready handshake OK (left then right)\n");
     }
 

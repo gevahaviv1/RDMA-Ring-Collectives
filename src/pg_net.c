@@ -62,8 +62,8 @@ static void wire_to_boot(const struct wire_boot *in, struct qp_boot *out) {
 static void pack_boot_for_right(struct pg *pg, const union ibv_gid *gid,
                                 uint16_t lid, uint32_t psn, struct qp_boot *b) {
     memset(b, 0, sizeof(*b));
-    // Export our LEFT-facing QP so RIGHT neighbor can program its qp_left
-    b->qpn   = pg->qp_left->qp_num;
+    // Export our RIGHT-facing QP so RIGHT neighbor can program its qp_left
+    b->qpn   = pg->qp_right->qp_num;
     b->psn   = psn;
     b->lid   = lid;
     memcpy(b->gid, gid, 16);
@@ -77,8 +77,8 @@ static void pack_boot_for_right(struct pg *pg, const union ibv_gid *gid,
 static void pack_boot_for_left(struct pg *pg, const union ibv_gid *gid,
                                uint16_t lid, uint32_t psn, struct qp_boot *b) {
     memset(b, 0, sizeof(*b));
-    // Export our RIGHT-facing QP so LEFT neighbor can program its qp_right
-    b->qpn   = pg->qp_right->qp_num;
+    // Export our LEFT-facing QP so LEFT neighbor can program its qp_right
+    b->qpn   = pg->qp_left->qp_num;
     b->psn   = psn;
     b->lid   = lid;
     memcpy(b->gid, gid, 16);
@@ -568,39 +568,39 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
     uint32_t psn_right = (psns[1] & 0xFFFFFF) ?: 1; // ensure not 0
 
     // Ensure PSN in each blob matches the exported local QP
-    pack_boot_for_left(pg,  &local_gid, port_attr.lid, psn_right, &my_left);  // exports qp_right
-    pack_boot_for_right(pg, &local_gid, port_attr.lid, psn_left,  &my_right); // exports qp_left
+    pack_boot_for_left(pg,  &local_gid, port_attr.lid, psn_left,  &my_left);  // exports qp_left
+    pack_boot_for_right(pg, &local_gid, port_attr.lid, psn_right, &my_right); // exports qp_right
 
     // 3. Exchange bootstrap info with neighbors.
     // Classic ring-safe ordering:
     //   - rank 0: send-first to right, then recv-first from left
     //   - others: recv-first from left, then send-first to right
     if (pg->rank == 0) {
-        fprintf(stderr, "[boot] (rank0) exch with right (send-first): send my L=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
-        fprintf(stderr, "[boot] (rank%d) exch with right: sending my L=%u, expecting peer_left\n",
-                pg->rank, pg->qp_left->qp_num);
+        fprintf(stderr, "[boot] (rank0) exch with right (send-first): send my R=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with right: sending my R=%u, expecting peer_left\n",
+                pg->rank, pg->qp_right->qp_num);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
         }
-        fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send my R=%u psn=%u\n", my_left.qpn, my_left.psn);
-        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my R=%u, expecting peer_right\n",
-                pg->rank, pg->qp_right->qp_num);
+        fprintf(stderr, "[boot] (rank0) exch with left (recv-first): recv peer_right, then send my L=%u psn=%u\n", my_left.qpn, my_left.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my L=%u, expecting peer_right\n",
+                pg->rank, pg->qp_left->qp_num);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
     } else {
-        fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send my R=%u psn=%u\n", my_left.qpn, my_left.psn);
-        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my R=%u, expecting peer_right\n",
-                pg->rank, pg->qp_right->qp_num);
+        fprintf(stderr, "[boot] exch with left (recv-first): recv peer_right, then send my L=%u psn=%u\n", my_left.qpn, my_left.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with left:  sending my L=%u, expecting peer_right\n",
+                pg->rank, pg->qp_left->qp_num);
         if (pgnet_exchange_qp(left_fd, &my_left, &pg->left_qp, 0) != 0) {
             fprintf(stderr, "Bootstrap exchange with left neighbor failed\n");
             return -1;
         }
-        fprintf(stderr, "[boot] exch with right (send-first): send my L=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
-        fprintf(stderr, "[boot] (rank%d) exch with right: sending my L=%u, expecting peer_left\n",
-                pg->rank, pg->qp_left->qp_num);
+        fprintf(stderr, "[boot] exch with right (send-first): send my R=%u psn=%u, then recv peer_left\n", my_right.qpn, my_right.psn);
+        fprintf(stderr, "[boot] (rank%d) exch with right: sending my R=%u, expecting peer_left\n",
+                pg->rank, pg->qp_right->qp_num);
         if (pgnet_exchange_qp(right_fd, &my_right, &pg->right_qp, 1) != 0) {
             fprintf(stderr, "Bootstrap exchange with right neighbor failed\n");
             return -1;
@@ -613,6 +613,10 @@ static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
             pg->rank,
             pg->left_qp.qpn, (unsigned)pg->left_qp.lid, pg->left_qp.psn,
             pg->right_qp.qpn, (unsigned)pg->right_qp.lid, pg->right_qp.psn);
+
+    // Check summary for cross-rank matches
+    fprintf(stderr, "[check] right_blob.qpn (got=%u) should equal next.rank qp_left\n",  pg->right_qp.qpn);
+    fprintf(stderr, "[check] left_blob.qpn  (got=%u) should equal prev.rank qp_right\n", pg->left_qp.qpn);
 
     // 4. Dump received remote info for diagnostics, then transition to RTR/RTS.
     fprintf(stderr, "[boot] rx left:  qpn=%u psn=%u rkey=%u bytes=%u gid=",

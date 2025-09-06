@@ -436,41 +436,59 @@ static int pgnet_poll_until_ready(int listen_fd, const char *right_host, int rig
  * @param send_first If true, send local info before receiving remote info.
  * @return 0 on success, -1 on failure.
  */
-static int pgnet_exchange_qp(int fd, const struct qp_boot *local, struct qp_boot *remote, int send_first) {
-    struct wire_boot wb_local, wb_remote;
-    boot_to_wire(local, &wb_local);
-    if (send_first) {
-        if (writen(fd, &wb_local, sizeof(wb_local)) != 0) return -1;
-        if (readn(fd, &wb_remote, sizeof(wb_remote)) != 0) return -1;
-        // One-shot ACK: sender side. Echo our sent qpn and expect peer's qpn back.
-        uint32_t want = local->qpn;
-        uint32_t got = htonl(want);
-        if (writen(fd, &got, sizeof(got)) != 0) return -1;
-        if (readn(fd, &got, sizeof(got)) != 0) return -1;
-        got = ntohl(got);
-        uint32_t peer_qpn = ntohl(wb_remote.qpn);
-        if (got != peer_qpn) {
-            fprintf(stderr, "[boot] ACK mismatch: sent_qpn=%u peer_thinks=%u\n", want, got);
+enum exch_mode { SEND_FIRST = 0, RECV_FIRST = 1 };
+
+static int exch_boot_with_ack(int fd, enum exch_mode mode,
+                              const struct qp_boot *my,
+                              struct qp_boot *peer) {
+    struct wire_boot wb_my, wb_peer;
+    uint32_t ack; // host order
+
+    if (mode == SEND_FIRST) {
+        boot_to_wire(my, &wb_my);
+        if (writen(fd, &wb_my, sizeof(wb_my)) != 0) return -1;
+        if (readn(fd, &wb_peer, sizeof(wb_peer)) != 0) return -1;
+        wire_to_boot(&wb_peer, peer);
+
+        // ACK: tell peer we received its struct by echoing peer->qpn
+        ack = htonl(peer->qpn);
+        if (writen(fd, &ack, sizeof(ack)) != 0) return -1;
+        // Expect peer to echo our qpn back
+        if (readn(fd, &ack, sizeof(ack)) != 0) return -1;
+        ack = ntohl(ack);
+        if (ack != my->qpn) {
+            fprintf(stderr, "[boot] ACK mismatch (send-first): my_sent=%u peer_echo=%u\n",
+                    my->qpn, ack);
             return -1;
         }
-        fprintf(stderr, "[boot] ack ok: sent=%u peer_qpn=%u\n", want, peer_qpn);
-    } else {
-        if (readn(fd, &wb_remote, sizeof(wb_remote)) != 0) return -1;
-        if (writen(fd, &wb_local, sizeof(wb_local)) != 0) return -1;
-        // One-shot ACK: receiver side. Read sender's qpn and echo back peer's qpn.
-        uint32_t got = 0;
-        uint32_t echo = htonl(ntohl(wb_remote.qpn));
-        if (readn(fd, &got, sizeof(got)) != 0) return -1; // sender's qpn
-        if (writen(fd, &echo, sizeof(echo)) != 0) return -1;
-        got = ntohl(got);
-        if (got != local->qpn) {
-            fprintf(stderr, "[boot] PEER ACK mismatch: peer_sent_qpn=%u my_sent_qpn=%u\n", got, local->qpn);
+        // ack ok for send-first handled by unified print at end
+    } else { // RECV_FIRST
+        if (readn(fd, &wb_peer, sizeof(wb_peer)) != 0) return -1;
+        wire_to_boot(&wb_peer, peer);
+        boot_to_wire(my, &wb_my);
+        if (writen(fd, &wb_my, sizeof(wb_my)) != 0) return -1;
+
+        // Expect peer to send us our qpn as ACK
+        if (readn(fd, &ack, sizeof(ack)) != 0) return -1;
+        ack = ntohl(ack);
+        if (ack != my->qpn) {
+            fprintf(stderr, "[boot] PEER ACK mismatch (recv-first): want=%u got=%u\n", my->qpn, ack);
             return -1;
         }
-        fprintf(stderr, "[boot] ack ok: peer_sent=%u my_sent=%u\n", got, local->qpn);
+        // Echo back that we received peer by sending peer->qpn
+        ack = htonl(peer->qpn);
+        if (writen(fd, &ack, sizeof(ack)) != 0) return -1;
+        // ack ok for recv-first handled by unified print at end
     }
-    wire_to_boot(&wb_remote, remote);
+    // Unified success print after either mode completes successfully
+    fprintf(stderr, "[boot] ack ok: my=%u peer=%u (%s)\n",
+            my->qpn, peer->qpn, mode == SEND_FIRST ? "send-first" : "recv-first");
     return 0;
+}
+
+static int pgnet_exchange_qp(int fd, const struct qp_boot *local, struct qp_boot *remote, int send_first) {
+    enum exch_mode mode = send_first ? SEND_FIRST : RECV_FIRST;
+    return exch_boot_with_ack(fd, mode, local, remote);
 }
 
 /**

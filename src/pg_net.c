@@ -400,7 +400,45 @@ static int pgnet_exchange_qp(int fd, const struct qp_boot *local, struct qp_boot
  * @return 0 on success, -1 on failure.
  */
 static int pgnet_exchange_bootstrap(int left_fd, int right_fd, struct pg *pg) {
-    // 1. Query local addressing: GID for RoCE and LID for InfiniBand
+    // 1. If on RoCE and no explicit PG_GID_INDEX, auto-pick a suitable GID index.
+    {
+        struct ibv_port_attr pa; memset(&pa, 0, sizeof(pa));
+        if (ibv_query_port(pg->ctx, pg->ib_port, &pa) == 0 && pa.link_layer == IBV_LINK_LAYER_ETHERNET) {
+            const char *env_gidx = getenv("PG_GID_INDEX");
+            if (!env_gidx || !*env_gidx) {
+                struct sockaddr_in local_ip; socklen_t llen = sizeof local_ip;
+                memset(&local_ip, 0, sizeof local_ip);
+                if (getsockname(right_fd, (struct sockaddr*)&local_ip, &llen) == 0 && local_ip.sin_family == AF_INET) {
+                    uint32_t my_ip_be = local_ip.sin_addr.s_addr; // network byte order
+                    union ibv_gid g; memset(&g, 0, sizeof g);
+                    int picked = -1, fallback = -1;
+                    int limit = pa.gid_tbl_len > 128 ? 128 : pa.gid_tbl_len;
+                    for (int i = 0; i < limit; ++i) {
+                        if (ibv_query_gid(pg->ctx, pg->ib_port, (uint8_t)i, &g) != 0) continue;
+                        int nonzero = 0; for (int b = 0; b < 16; ++b) { if (g.raw[b]) { nonzero = 1; break; } }
+                        if (!nonzero) continue;
+                        if (fallback < 0) fallback = i;
+                        uint32_t gid_ipv4_be = 0; memcpy(&gid_ipv4_be, &g.raw[12], 4);
+                        if (gid_ipv4_be == my_ip_be) { picked = i; break; }
+                    }
+                    if (picked >= 0) {
+                        fprintf(stderr, "[boot] auto-picked gid_index=%d matching local ip %s\n",
+                                picked, inet_ntoa(local_ip.sin_addr));
+                        pg->gid_index = (uint8_t)picked;
+                    } else if (fallback >= 0) {
+                        fprintf(stderr, "[boot] auto-picked first non-zero gid_index=%d (no IPv4 match)\n",
+                                fallback);
+                        pg->gid_index = (uint8_t)fallback;
+                    } else {
+                        fprintf(stderr, "[boot] warning: no non-zero GIDs found on port %u; keeping gid_index=%u\n",
+                                (unsigned)pg->ib_port, (unsigned)pg->gid_index);
+                    }
+                }
+            }
+        }
+    }
+
+    // 1b. Query local addressing: GID for RoCE and LID for InfiniBand
     union ibv_gid local_gid;
     if (rdma_query_gid(pg->ctx, pg->ib_port, pg->gid_index, &local_gid) != 0) {
         return -1;

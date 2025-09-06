@@ -199,6 +199,7 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
     attr.min_rnr_timer = 12; // 0.64ms, a common default
 
     // Address vector depends on link layer
+    // Allow tuning via environment for SL and src_path_bits when using LID routing
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.port_num = port;
@@ -219,8 +220,24 @@ int rdma_qp_to_rtr(struct ibv_qp *qp, struct qp_boot *remote, uint8_t port, uint
         // InfiniBand: address by LID; no GRH
         attr.ah_attr.is_global = 0;
         attr.ah_attr.dlid = remote->lid;
-        fprintf(stderr, "[rdma] to RTR: IB remote qpn=%u rq_psn=%u mtu=%d lid=%u\n",
-                remote->qpn, remote->psn, (int)mtu, (unsigned)remote->lid);
+
+        // Optional tuning from environment
+        const char *s_sl = getenv("PG_SL");
+        if (s_sl && *s_sl) {
+            int v = atoi(s_sl);
+            if (v < 0) v = 0; if (v > 15) v = 15;
+            attr.ah_attr.sl = (uint8_t)v;
+        }
+        const char *s_spb = getenv("PG_SRC_PATH_BITS");
+        if (s_spb && *s_spb) {
+            int v = atoi(s_spb);
+            if (v < 0) v = 0; if (v > 7) v = 7;
+            attr.ah_attr.src_path_bits = (uint8_t)v;
+        }
+
+        fprintf(stderr, "[rdma] to RTR: IB remote qpn=%u rq_psn=%u mtu=%d lid=%u sl=%u spb=%u\n",
+                remote->qpn, remote->psn, (int)mtu, (unsigned)remote->lid,
+                (unsigned)attr.ah_attr.sl, (unsigned)attr.ah_attr.src_path_bits);
     }
 
     if (ibv_modify_qp(qp, &attr, mask)) {

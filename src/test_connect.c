@@ -188,6 +188,8 @@ int main(int argc, char *argv[]) {
 
   // Post RECV from left neighbor using the library's MR
   fprintf(stderr, "Rank %d posting receive buffer...\n", myindex);
+  // Dump recv QP state for diagnostics before posting the RECV
+  debug_dump_qp(handle->qp_left, "recv_qp");
   if (post_one_recv(handle->qp_left, handle->mr, recv_buf)) {
     fprintf(stderr, "Failed to post RECV\n");
     return EXIT_FAILURE;
